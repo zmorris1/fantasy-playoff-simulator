@@ -26,6 +26,8 @@ elif DATABASE_URL.startswith("postgresql://") and "+asyncpg" not in DATABASE_URL
 engine = create_async_engine(
     DATABASE_URL,
     echo=os.getenv("SQL_ECHO", "false").lower() == "true",
+    pool_pre_ping=True,
+    pool_recycle=300,
 )
 
 # Create session factory

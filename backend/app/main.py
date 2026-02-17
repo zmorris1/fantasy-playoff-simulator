@@ -17,7 +17,12 @@ from .db import create_tables
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
     # Startup
-    await create_tables()
+    try:
+        await create_tables()
+    except Exception as e:
+        import logging
+        logging.getLogger("app").error(f"Failed to create tables on startup: {e}")
+        # App still starts — DB may become available later
     yield
     # Shutdown
 
