@@ -14,6 +14,7 @@ export default function YahooConnect({ onStatusChange, compact = false }: YahooC
 
   useEffect(() => {
     checkStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const checkStatus = async () => {

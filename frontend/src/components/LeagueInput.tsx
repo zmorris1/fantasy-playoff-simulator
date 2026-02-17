@@ -143,11 +143,12 @@ export default function LeagueInput({ onSubmit, loading, isLoggedIn = false }: L
       if (!result.valid) {
         setError(result.error || 'Invalid league');
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const axiosErr = err as { response?: { data?: { error?: string; detail?: string } }; message?: string };
       const message =
-        err?.response?.data?.error ||
-        err?.response?.data?.detail ||
-        err?.message ||
+        axiosErr?.response?.data?.error ||
+        axiosErr?.response?.data?.detail ||
+        axiosErr?.message ||
         'Failed to validate league';
       setError(message);
     } finally {
