@@ -47,13 +47,20 @@ app = FastAPI(
 )
 
 # CORS configuration
-# In production, replace with specific frontend URL
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
+cors_env = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000")
+if cors_env.strip() == "*":
+    CORS_ORIGINS = ["*"]
+    CORS_CREDENTIALS = False  # credentials not allowed with wildcard origin
+else:
+    CORS_ORIGINS = [o.strip() for o in cors_env.split(",") if o.strip()]
+    CORS_CREDENTIALS = True
+
+logger.info(f"CORS origins: {CORS_ORIGINS}")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
-    allow_credentials=True,
+    allow_credentials=CORS_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
