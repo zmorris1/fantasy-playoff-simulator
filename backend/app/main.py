@@ -5,6 +5,7 @@ Main entry point for the web API.
 """
 
 import os
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,17 +13,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from .api.routes import auth_router, leagues_router, simulations_router, yahoo_oauth_router, cbs_oauth_router
 from .db import create_tables
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("app")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
     # Startup
+    logger.info("Starting application...")
+    logger.info(f"DATABASE_URL configured: {'DATABASE_URL' in os.environ}")
+    logger.info(f"PORT: {os.environ.get('PORT', 'not set')}")
     try:
         await create_tables()
+        logger.info("Database tables created successfully")
     except Exception as e:
-        import logging
-        logging.getLogger("app").error(f"Failed to create tables on startup: {e}")
+        logger.error(f"Failed to create tables on startup: {e}")
         # App still starts — DB may become available later
+    logger.info("Application startup complete")
     yield
     # Shutdown
 
