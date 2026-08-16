@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { authApi, User } from '../api/client';
+import { authApi, getErrorMessage, User } from '../api/client';
 
 interface RegisterProps {
   onLogin: (token: string, user: User) => void;
@@ -37,15 +37,7 @@ export default function Register({ onLogin }: RegisterProps) {
       onLogin(access_token, user);
       navigate('/dashboard');
     } catch (err: unknown) {
-      interface ErrorResponse {
-        response?: {
-          data?: {
-            detail?: string;
-          };
-        };
-      }
-      const errorResponse = err as ErrorResponse;
-      setError(errorResponse.response?.data?.detail || 'Failed to create account');
+      setError(getErrorMessage(err, 'Failed to create account'));
     } finally {
       setLoading(false);
     }

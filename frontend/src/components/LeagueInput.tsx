@@ -1,5 +1,5 @@
 import { useState, useMemo, useEffect } from 'react';
-import { leaguesApi, yahooApi, cbsApi, LeagueValidation } from '../api/client';
+import { leaguesApi, yahooApi, cbsApi, getErrorMessage, LeagueValidation } from '../api/client';
 import YahooConnect from './YahooConnect';
 import CBSConnect from './CBSConnect';
 
@@ -79,7 +79,9 @@ export default function LeagueInput({ onSubmit, loading, isLoggedIn = false }: L
   const [sport, setSport] = useState<Sport>('basketball');
   const [platform, setPlatform] = useState('espn');
   const [leagueId, setLeagueId] = useState('');
-  const [season, setSeason] = useState(() => getDefaultSeason('basketball'));
+  // 'auto' lets the backend resolve the latest season with data, which
+  // matters in the off-season when the default-season guess doesn't exist yet
+  const [season, setSeason] = useState<number | 'auto'>('auto');
   const [validating, setValidating] = useState(false);
   const [validation, setValidation] = useState<LeagueValidation | null>(null);
   const [error, setError] = useState('');
@@ -114,7 +116,7 @@ export default function LeagueInput({ onSubmit, loading, isLoggedIn = false }: L
 
   const handleSportChange = (newSport: Sport) => {
     setSport(newSport);
-    setSeason(getDefaultSeason(newSport));
+    setSeason('auto');
     setValidation(null);
     setError('');
     // Reset platform to ESPN if switching to baseball while on Sleeper (not supported)
@@ -138,19 +140,18 @@ export default function LeagueInput({ onSubmit, loading, isLoggedIn = false }: L
     setValidation(null);
 
     try {
-      const result = await leaguesApi.validate(platform, leagueId.trim(), season, sport);
+      const result = await leaguesApi.validate(
+        platform,
+        leagueId.trim(),
+        season === 'auto' ? undefined : season,
+        sport
+      );
       setValidation(result);
       if (!result.valid) {
         setError(result.error || 'Invalid league');
       }
     } catch (err: unknown) {
-      const axiosErr = err as { response?: { data?: { error?: string; detail?: string } }; message?: string };
-      const message =
-        axiosErr?.response?.data?.error ||
-        axiosErr?.response?.data?.detail ||
-        axiosErr?.message ||
-        'Failed to validate league';
-      setError(message);
+      setError(getErrorMessage(err, 'Failed to validate league'));
     } finally {
       setValidating(false);
     }
@@ -159,7 +160,9 @@ export default function LeagueInput({ onSubmit, loading, isLoggedIn = false }: L
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (validation?.valid) {
-      onSubmit(platform, leagueId.trim(), season, sport);
+      const resolvedSeason =
+        season === 'auto' ? validation.season ?? getDefaultSeason(sport) : season;
+      onSubmit(platform, leagueId.trim(), resolvedSeason, sport);
     } else {
       handleValidate();
     }
@@ -291,12 +294,13 @@ export default function LeagueInput({ onSubmit, loading, isLoggedIn = false }: L
           <select
             value={season}
             onChange={(e) => {
-              setSeason(Number(e.target.value));
+              setSeason(e.target.value === 'auto' ? 'auto' : Number(e.target.value));
               setValidation(null);
             }}
             className="input"
             disabled={loading}
           >
+            <option value="auto">Auto (latest available)</option>
             {seasonOptions.map((yr) => (
               <option key={yr} value={yr}>
                 {formatSeason(yr, sport)}
@@ -319,6 +323,14 @@ export default function LeagueInput({ onSubmit, loading, isLoggedIn = false }: L
             <p className="text-sm">
               {validation.num_divisions} divisions, {validation.playoff_spots} playoff spots
             </p>
+            {season === 'auto' &&
+              validation.season != null &&
+              validation.season !== getDefaultSeason(sport) && (
+                <p className="text-sm mt-1">
+                  No {formatSeason(getDefaultSeason(sport), sport)} data yet — showing{' '}
+                  {formatSeason(validation.season, sport)}.
+                </p>
+              )}
           </div>
         )}
 

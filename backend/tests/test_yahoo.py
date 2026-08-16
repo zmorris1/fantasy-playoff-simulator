@@ -123,12 +123,12 @@ class TestYahooAdapterXMLParsing:
 class TestYahooAdapterTokenHandling:
     """Tests for OAuth token handling."""
 
-    def test_no_credential_raises_error(self):
+    @pytest.mark.asyncio
+    async def test_no_credential_raises_error(self):
         """Test that missing credential raises PlatformError."""
         adapter = YahooAdapter(sport=Sport.BASKETBALL, credential=None)
         with pytest.raises(PlatformError, match="credential is required"):
-            import asyncio
-            asyncio.get_event_loop().run_until_complete(adapter._ensure_valid_token())
+            await adapter._ensure_valid_token()
 
     @pytest.mark.asyncio
     async def test_valid_token_returned_directly(self, adapter):

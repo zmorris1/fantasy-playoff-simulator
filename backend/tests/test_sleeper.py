@@ -36,9 +36,13 @@ class TestSleeperAdapter:
         with pytest.raises(ValueError, match="does not support baseball"):
             SleeperAdapter(sport=Sport.BASEBALL)
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_validate_league_not_found(self, adapter):
-        """Test validate_league raises LeagueNotFoundError for invalid league."""
+        """Test validate_league raises LeagueNotFoundError for invalid league.
+
+        Hits the live Sleeper API — marked integration, excluded in CI.
+        """
         with pytest.raises(LeagueNotFoundError):
             await adapter.validate_league("invalid_league_id", 2025)
 
@@ -156,8 +160,9 @@ class TestSleeperAdapter:
         assert h2h[(1, 2)] == (1, 1, 0)
 
 
+@pytest.mark.integration
 class TestSleeperAdapterIntegration:
-    """Integration tests that hit the real Sleeper API."""
+    """Integration tests that hit the real Sleeper API. Excluded in CI."""
 
     @pytest.mark.asyncio
     async def test_nfl_state_endpoint(self, adapter):

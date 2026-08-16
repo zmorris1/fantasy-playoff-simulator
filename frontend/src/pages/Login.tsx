@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { authApi, User } from '../api/client';
+import { authApi, getErrorMessage, User } from '../api/client';
 
 interface LoginProps {
   onLogin: (token: string, user: User) => void;
@@ -25,15 +25,7 @@ export default function Login({ onLogin }: LoginProps) {
       onLogin(access_token, user);
       navigate('/dashboard');
     } catch (err: unknown) {
-      interface ErrorResponse {
-        response?: {
-          data?: {
-            detail?: string;
-          };
-        };
-      }
-      const errorResponse = err as ErrorResponse;
-      setError(errorResponse.response?.data?.detail || 'Invalid email or password');
+      setError(getErrorMessage(err, 'Invalid email or password'));
     } finally {
       setLoading(false);
     }

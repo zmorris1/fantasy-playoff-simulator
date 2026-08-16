@@ -54,6 +54,7 @@ class LeagueValidateResponse(BaseModel):
     playoff_spots: Optional[int] = None
     num_divisions: Optional[int] = None
     sport: Optional[str] = None
+    season: Optional[int] = None  # The season that was actually validated
     error: Optional[str] = None
 
 

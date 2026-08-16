@@ -2,12 +2,66 @@ import axios from 'axios';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || '/api';
 
+// Without a timeout, a hung backend leaves requests spinning forever.
+const REQUEST_TIMEOUT_MS = 45000;
+
 export const api = axios.create({
   baseURL: API_BASE_URL,
+  timeout: REQUEST_TIMEOUT_MS,
   headers: {
     'Content-Type': 'application/json',
   },
 });
+
+/**
+ * Translate a request failure into a message that distinguishes
+ * "the backend is unreachable/broken" from a real API error, so the UI
+ * never blames the user's input for a server outage.
+ */
+export function getErrorMessage(err: unknown, fallback: string): string {
+  if (axios.isAxiosError(err)) {
+    if (err.code === 'ECONNABORTED') {
+      return 'The server took too long to respond. It may be down or overloaded — please try again in a few minutes.';
+    }
+    if (!err.response) {
+      return "Can't reach the server. The site's backend appears to be down — this is not a problem with what you entered.";
+    }
+
+    const { status, data } = err.response;
+
+    // HTML instead of JSON means the request hit a web server, not the API
+    // (e.g. a misconfigured VITE_API_URL serving index.html with a 200).
+    if (typeof data === 'string' && /^\s*(<!doctype|<html)/i.test(data)) {
+      return 'The server returned a web page instead of data — the backend API is misconfigured or down.';
+    }
+
+    if (status >= 500) {
+      return `The server hit an internal error (HTTP ${status}). This is a problem on our end — please try again shortly.`;
+    }
+
+    const body = data as { detail?: unknown; error?: unknown } | undefined;
+    if (typeof body?.detail === 'string') return body.detail;
+    if (typeof body?.error === 'string') return body.error;
+  }
+  return fallback;
+}
+
+// Health API
+export const healthApi = {
+  /**
+   * True only if /api/health returns the expected JSON shape. A bare 200
+   * is not enough: a misconfigured API URL can return index.html with 200.
+   */
+  check: async (): Promise<boolean> => {
+    try {
+      const response = await api.get('/health', { timeout: 10000 });
+      const data = response.data as { status?: string } | null;
+      return typeof data === 'object' && data !== null && data.status === 'healthy';
+    } catch {
+      return false;
+    }
+  },
+};
 
 // Add auth token to requests
 api.interceptors.request.use((config) => {
@@ -183,6 +237,7 @@ export interface LeagueValidation {
   playoff_spots?: number;
   num_divisions?: number;
   sport?: string;
+  season?: number;
   error?: string;
 }
 
