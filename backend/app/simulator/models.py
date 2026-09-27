@@ -125,13 +125,19 @@ class SimulationResult:
 
 @dataclass
 class MagicNumbers:
-    """Magic numbers for a team."""
+    """Magic numbers for a team, plus mathematical clinch/elimination status."""
 
     team_id: int
     magic_division: Optional[int] = None
     magic_playoffs: Optional[int] = None
     magic_first_seed: Optional[int] = None
     magic_last: Optional[int] = None
+    clinched_division: bool = False
+    clinched_playoffs: bool = False
+    clinched_first_seed: bool = False
+    eliminated_division: bool = False
+    eliminated_playoffs: bool = False
+    eliminated_first_seed: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -139,7 +145,13 @@ class MagicNumbers:
             "magic_division": self.magic_division,
             "magic_playoffs": self.magic_playoffs,
             "magic_first_seed": self.magic_first_seed,
-            "magic_last": self.magic_last
+            "magic_last": self.magic_last,
+            "clinched_division": self.clinched_division,
+            "clinched_playoffs": self.clinched_playoffs,
+            "clinched_first_seed": self.clinched_first_seed,
+            "eliminated_division": self.eliminated_division,
+            "eliminated_playoffs": self.eliminated_playoffs,
+            "eliminated_first_seed": self.eliminated_first_seed
         }
 
 
