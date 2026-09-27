@@ -282,7 +282,8 @@ async def run_simulation_task(
                     clinched_playoffs=team_magic.clinched_playoffs,
                     clinched_first_seed=team_magic.clinched_first_seed,
                     eliminated_division=team_magic.eliminated_division,
-                    eliminated_playoffs=team_magic.eliminated_playoffs
+                    eliminated_playoffs=team_magic.eliminated_playoffs,
+                    eliminated_first_seed=team_magic.eliminated_first_seed
                 ))
 
             response_data = SimulationResultsResponse(

@@ -42,6 +42,11 @@ export function getErrorMessage(err: unknown, fallback: string): string {
     const body = data as { detail?: unknown; error?: unknown } | undefined;
     if (typeof body?.detail === 'string') return body.detail;
     if (typeof body?.error === 'string') return body.error;
+    // FastAPI validation errors: [{ msg: "Value error, ...", ... }]
+    if (Array.isArray(body?.detail)) {
+      const first = body.detail[0] as { msg?: unknown } | undefined;
+      if (typeof first?.msg === 'string') return first.msg.replace(/^Value error, /, '');
+    }
   }
   return fallback;
 }
@@ -137,80 +142,86 @@ export const leaguesApi = {
   },
 };
 
-// Yahoo OAuth API
-export const yahooApi = {
-  getAuthorizationUrl: async () => {
-    const response = await api.get('/oauth/yahoo/authorize');
-    return response.data as { url: string; state: string };
-  },
+// OAuth connections (Yahoo)
+export type OAuthProvider = 'yahoo' | 'cbs';
 
-  getConnectionStatus: async () => {
-    const response = await api.get('/oauth/yahoo/status');
-    return response.data as { connected: boolean; yahoo_guid?: string };
-  },
+export interface ConnectionStatus {
+  connected: boolean;
+  account_id?: string;
+}
 
-  disconnect: async () => {
-    await api.delete('/oauth/yahoo/disconnect');
-  },
-};
+function oauthApi(provider: OAuthProvider) {
+  return {
+    getAuthorizationUrl: async () => {
+      const response = await api.get(`/oauth/${provider}/authorize`);
+      return response.data as { url: string; state: string };
+    },
 
-// CBS OAuth API
-export const cbsApi = {
-  getAuthorizationUrl: async () => {
-    const response = await api.get('/oauth/cbs/authorize');
-    return response.data as { url: string; state: string };
-  },
+    getConnectionStatus: async () => {
+      const response = await api.get(`/oauth/${provider}/status`);
+      return response.data as ConnectionStatus;
+    },
 
-  getConnectionStatus: async () => {
-    const response = await api.get('/oauth/cbs/status');
-    return response.data as { connected: boolean; cbs_user_id?: string };
-  },
+    /** Finish connecting after the provider redirects back with ?code&state. */
+    completeConnection: async (code: string, state: string) => {
+      const response = await api.post(`/oauth/${provider}/callback`, { code, state });
+      return response.data as ConnectionStatus;
+    },
 
-  disconnect: async () => {
-    await api.delete('/oauth/cbs/disconnect');
-  },
-};
+    disconnect: async () => {
+      await api.delete(`/oauth/${provider}/disconnect`);
+    },
+  };
+}
+
+export const yahooApi = oauthApi('yahoo');
+
+/**
+ * Which provider issued an OAuth state. The state is a signed JWT whose
+ * payload names the provider; the server verifies it, this just routes it.
+ */
+export function oauthProviderFromState(state: string): OAuthProvider | null {
+  try {
+    const payload = state.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    const { prov } = JSON.parse(atob(payload)) as { prov?: unknown };
+    return prov === 'yahoo' || prov === 'cbs' ? prov : null;
+  } catch {
+    return null;
+  }
+}
+
+export function completeOAuthConnection(provider: OAuthProvider, code: string, state: string) {
+  return oauthApi(provider).completeConnection(code, state);
+}
 
 // Simulations API
 export const simulationsApi = {
-  run: async (platform: string, leagueId: string, season?: number, sport: string = 'basketball', quickMode = false) => {
+  run: async (
+    platform: string,
+    leagueId: string,
+    season?: number,
+    sport: string = 'basketball',
+    options: { quickMode?: boolean; refresh?: boolean } = {}
+  ) => {
     const response = await api.post('/simulations/run', {
       platform,
       league_id: leagueId,
       season,
       sport,
-      quick_mode: quickMode,
+      quick_mode: options.quickMode ?? false,
+      refresh: options.refresh ?? false,
     });
-    return response.data;
+    return response.data as SimulationTask;
   },
 
   getStatus: async (taskId: string) => {
     const response = await api.get(`/simulations/${taskId}/status`);
-    return response.data;
+    return response.data as ProgressData;
   },
 
   getResults: async (taskId: string) => {
     const response = await api.get(`/simulations/${taskId}/results`);
-    return response.data;
-  },
-
-  streamProgress: (taskId: string, onProgress: (data: ProgressData) => void) => {
-    const eventSource = new EventSource(`${API_BASE_URL}/simulations/${taskId}/stream`);
-
-    eventSource.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      onProgress(data);
-
-      if (data.status === 'completed' || data.status === 'failed') {
-        eventSource.close();
-      }
-    };
-
-    eventSource.onerror = () => {
-      eventSource.close();
-    };
-
-    return eventSource;
+    return response.data as SimulationResults;
   },
 };
 
@@ -260,6 +271,12 @@ export interface TeamResult {
   magic_playoffs: number | null;
   magic_first_seed: number | null;
   magic_last: number | null;
+  clinched_division: boolean;
+  clinched_playoffs: boolean;
+  clinched_first_seed: boolean;
+  eliminated_division: boolean;
+  eliminated_playoffs: boolean;
+  eliminated_first_seed: boolean;
 }
 
 export interface SimulationResults {
@@ -274,8 +291,11 @@ export interface SimulationResults {
   teams: TeamResult[];
   clinch_scenarios: string[];
   elimination_scenarios: string[];
+  scenario_week?: number | null;
+  categories_per_matchup: number;
+  notes: string[];
   cached: boolean;
-  cached_at?: string;
+  cached_at?: string | null;
 }
 
 export interface ProgressData {

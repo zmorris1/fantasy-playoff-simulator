@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
-import { useParams, Link } from 'react-router-dom';
-import { simulationsApi, leaguesApi, SimulationResults, User } from '../api/client';
+import { useParams, Link, useNavigate } from 'react-router-dom';
+import { simulationsApi, leaguesApi, getErrorMessage, SimulationResults, User } from '../api/client';
 import StandingsTable from '../components/StandingsTable';
 import ScenarioCard from '../components/ScenarioCard';
 import ProgressIndicator from '../components/ProgressIndicator';
@@ -9,62 +9,83 @@ interface ResultsProps {
   user: User | null;
 }
 
+const POLL_INTERVAL_MS = 1000;
+// Consecutive failed status checks tolerated before giving up (network blips)
+const MAX_POLL_ERRORS = 5;
+
+function formatSeason(season: number, sport: string): string {
+  return sport === 'basketball' || sport === 'hockey' ? `${season - 1}-${season}` : `${season}`;
+}
+
+function timeAgo(iso: string): string {
+  const minutes = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+  if (minutes < 1) return 'just now';
+  return minutes === 1 ? '1 minute ago' : `${minutes} minutes ago`;
+}
+
+function isNotFound(err: unknown): boolean {
+  return (err as { response?: { status?: number } })?.response?.status === 404;
+}
+
 export default function Results({ user }: ResultsProps) {
   const { taskId } = useParams<{ taskId: string }>();
+  const navigate = useNavigate();
   const [results, setResults] = useState<SimulationResults | null>(null);
-  const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [progress, setProgress] = useState(0);
   const [status, setStatus] = useState('pending');
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [saveError, setSaveError] = useState('');
+  const [rerunning, setRerunning] = useState(false);
 
   useEffect(() => {
     if (!taskId) return;
 
-    const fetchResults = async () => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let consecutiveErrors = 0;
+
+    setResults(null);
+    setError('');
+    setProgress(0);
+    setStatus('pending');
+
+    const poll = async () => {
       try {
-        // First check status
         const taskStatus = await simulationsApi.getStatus(taskId);
+        if (cancelled) return;
+        consecutiveErrors = 0;
         setProgress(taskStatus.progress);
         setStatus(taskStatus.status);
 
         if (taskStatus.status === 'completed') {
           const data = await simulationsApi.getResults(taskId);
-          setResults(data);
-          setLoading(false);
+          if (!cancelled) setResults(data);
         } else if (taskStatus.status === 'failed') {
           setError(taskStatus.error || 'Simulation failed');
-          setLoading(false);
         } else {
-          // Still running, poll for updates
-          const interval = setInterval(async () => {
-            const status = await simulationsApi.getStatus(taskId);
-            setProgress(status.progress);
-            setStatus(status.status);
-
-            if (status.status === 'completed') {
-              clearInterval(interval);
-              const data = await simulationsApi.getResults(taskId);
-              setResults(data);
-              setLoading(false);
-            } else if (status.status === 'failed') {
-              clearInterval(interval);
-              setError(status.error || 'Simulation failed');
-              setLoading(false);
-            }
-          }, 1000);
-
-          return () => clearInterval(interval);
+          timer = setTimeout(poll, POLL_INTERVAL_MS);
         }
       } catch (err) {
-        setError('Failed to fetch results');
-        setLoading(false);
+        if (cancelled) return;
+        consecutiveErrors += 1;
+        if (isNotFound(err)) {
+          setError('These results are no longer available. Simulations are kept for 24 hours — run it again for fresh odds.');
+        } else if (consecutiveErrors < MAX_POLL_ERRORS) {
+          timer = setTimeout(poll, POLL_INTERVAL_MS * 2);
+        } else {
+          setError(getErrorMessage(err, 'Failed to fetch results'));
+        }
       }
     };
 
-    fetchResults();
+    poll();
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
   }, [taskId]);
 
   const handleSaveLeague = async () => {
@@ -83,15 +104,7 @@ export default function Results({ user }: ResultsProps) {
       );
       setSaved(true);
     } catch (err: unknown) {
-      interface ErrorResponse {
-        response?: {
-          data?: {
-            detail?: string;
-          };
-        };
-      }
-      const errorResponse = err as ErrorResponse;
-      const errorMessage = errorResponse.response?.data?.detail || 'Failed to save league';
+      const errorMessage = getErrorMessage(err, 'Failed to save league');
       if (errorMessage.includes('already saved')) {
         setSaved(true);
       } else {
@@ -102,9 +115,27 @@ export default function Results({ user }: ResultsProps) {
     }
   };
 
-  if (loading) {
-    return <ProgressIndicator progress={progress} status={status} />;
-  }
+  const handleRerun = async () => {
+    if (!results) return;
+
+    setRerunning(true);
+    setSaveError('');
+
+    try {
+      const task = await simulationsApi.run(
+        results.platform,
+        results.league_id,
+        results.season,
+        results.sport,
+        { refresh: true }
+      );
+      navigate(`/results/${task.task_id}`);
+    } catch (err: unknown) {
+      setSaveError(getErrorMessage(err, 'Failed to start simulation'));
+    } finally {
+      setRerunning(false);
+    }
+  };
 
   if (error) {
     return (
@@ -121,23 +152,39 @@ export default function Results({ user }: ResultsProps) {
   }
 
   if (!results) {
-    return null;
+    return <ProgressIndicator progress={progress} status={status} />;
   }
+
+  const unit = results.categories_per_matchup > 1 ? 'category wins' : 'wins';
+  const scenarioWeek = results.scenario_week ?? results.current_week;
+  const allDecided = results.teams.every((t) => t.clinched_playoffs || t.eliminated_playoffs);
 
   return (
     <div className="max-w-7xl mx-auto">
       {/* Header */}
       <div className="mb-8">
-        <div className="flex justify-between items-start">
+        <div className="flex flex-col gap-4 sm:flex-row sm:justify-between sm:items-start">
           <div>
             <h1 className="text-3xl font-bold text-gray-900 mb-2">
               {results.league_name}
             </h1>
             <p className="text-gray-600">
-              {results.sport.charAt(0).toUpperCase() + results.sport.slice(1)} | Week {results.current_week} of {results.total_weeks} | {results.sport === 'basketball' ? `${results.season - 1}-${results.season}` : results.season} Season
+              {results.sport.charAt(0).toUpperCase() + results.sport.slice(1)} | Week {results.current_week} of {results.total_weeks} | {formatSeason(results.season, results.sport)} Season
             </p>
             <p className="text-sm text-gray-500 mt-1">
               Based on {results.n_simulations.toLocaleString()} Monte Carlo simulations
+              {results.cached && results.cached_at && (
+                <>
+                  {' '}run {timeAgo(results.cached_at)}.{' '}
+                  <button
+                    onClick={handleRerun}
+                    disabled={rerunning}
+                    className="text-primary-600 hover:text-primary-700 underline"
+                  >
+                    {rerunning ? 'Starting...' : 'Re-run now'}
+                  </button>
+                </>
+              )}
             </p>
           </div>
           <div className="flex gap-2">
@@ -169,17 +216,31 @@ export default function Results({ user }: ResultsProps) {
             {saveError}
           </div>
         )}
+        {results.notes.length > 0 && (
+          <div className="mt-4 p-3 bg-blue-50 border border-blue-200 rounded-lg text-blue-800 text-sm space-y-1">
+            {results.notes.map((note) => (
+              <p key={note}>{note}</p>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Standings Table */}
       <div className="card mb-8 overflow-hidden">
         <h2 className="text-xl font-bold text-gray-900 mb-4">Playoff Probabilities</h2>
         <StandingsTable teams={results.teams} />
-        <div className="mt-4 text-xs text-gray-500">
-          <p><strong>M# Div</strong> = Wins needed to clinch division</p>
-          <p><strong>M# Ply</strong> = Wins needed to clinch playoff spot</p>
-          <p><strong>M# #1</strong> = Wins needed to clinch #1 seed</p>
-          <p><strong>M# Last</strong> = Losses needed to secure last place</p>
+        <div className="mt-4 text-xs text-gray-500 space-y-1">
+          <p>
+            <strong>M#</strong> = magic number: {unit} that guarantee the goal no matter what else happens
+            (<strong>Div</strong> division, <strong>Ply</strong> playoff spot, <strong>#1</strong> top seed).
+            <strong> M# Last</strong> = losses that guarantee last place.
+          </p>
+          <p>
+            <span className="text-green-700 font-semibold">&#10003;</span> clinched,{' '}
+            <span className="text-red-600 font-semibold">&#10007;</span> eliminated,{' '}
+            &ndash; can&apos;t be guaranteed without help from other results.
+            {' '}Badges: <strong>z</strong> #1 seed, <strong>y</strong> division, <strong>x</strong> playoff spot, <strong>e</strong> eliminated.
+          </p>
         </div>
       </div>
 
@@ -187,12 +248,12 @@ export default function Results({ user }: ResultsProps) {
       {(results.clinch_scenarios.length > 0 || results.elimination_scenarios.length > 0) && (
         <div className="grid md:grid-cols-2 gap-6 mb-8">
           <ScenarioCard
-            title={`Paths to Clinch (Week ${results.current_week})`}
+            title={`Paths to Clinch (Week ${scenarioWeek})`}
             scenarios={results.clinch_scenarios}
             type="clinch"
           />
           <ScenarioCard
-            title={`Paths to Elimination (Week ${results.current_week})`}
+            title={`Paths to Elimination (Week ${scenarioWeek})`}
             scenarios={results.elimination_scenarios}
             type="elimination"
           />
@@ -203,7 +264,9 @@ export default function Results({ user }: ResultsProps) {
       {results.clinch_scenarios.length === 0 && results.elimination_scenarios.length === 0 && (
         <div className="card bg-gray-50 text-center">
           <p className="text-gray-600">
-            No clinch or elimination scenarios this week. Every team's playoff fate is still undetermined.
+            {allDecided
+              ? 'Every playoff spot has been decided.'
+              : 'No team can clinch or be eliminated by its own result this week.'}
           </p>
         </div>
       )}

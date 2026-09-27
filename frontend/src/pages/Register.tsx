@@ -28,6 +28,12 @@ export default function Register({ onLogin }: RegisterProps) {
       return;
     }
 
+    // bcrypt uses at most 72 bytes (accented characters and emoji take several)
+    if (new TextEncoder().encode(password).length > 72) {
+      setError('Password is too long (72 bytes max)');
+      return;
+    }
+
     setLoading(true);
 
     try {

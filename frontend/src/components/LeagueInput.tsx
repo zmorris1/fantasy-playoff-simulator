@@ -1,7 +1,6 @@
 import { useState, useMemo, useEffect } from 'react';
-import { leaguesApi, yahooApi, cbsApi, getErrorMessage, LeagueValidation } from '../api/client';
+import { leaguesApi, yahooApi, getErrorMessage, LeagueValidation } from '../api/client';
 import YahooConnect from './YahooConnect';
-import CBSConnect from './CBSConnect';
 
 interface LeagueInputProps {
   onSubmit: (platform: string, leagueId: string, season: number, sport: string) => void;
@@ -10,6 +9,17 @@ interface LeagueInputProps {
 }
 
 type Sport = 'basketball' | 'football' | 'baseball' | 'hockey';
+
+// Platforms with fantasy hockey (Sleeper has none)
+const HOCKEY_PLATFORMS = ['espn', 'yahoo', 'fantrax'];
+
+// Yahoo league URLs: https://{sport}.fantasysports.yahoo.com/{path}/{league id}
+const YAHOO_URL_PATHS: Record<Sport, string> = {
+  basketball: 'nba',
+  football: 'f1',
+  baseball: 'b1',
+  hockey: 'hockey',
+};
 
 // Calculate default season based on sport
 function getDefaultSeason(sport: Sport): number {
@@ -59,8 +69,7 @@ function formatSeason(season: number, sport: Sport): string {
 // Get URL hint based on sport and platform
 function getUrlHint(sport: Sport, platform: string): string {
   if (platform === 'yahoo') {
-    const sportPath = sport === 'basketball' ? 'nba' : sport === 'football' ? 'nfl' : sport === 'hockey' ? 'nhl' : 'mlb';
-    return `baseball.fantasysports.yahoo.com/${sportPath}/`;
+    return `${sport}.fantasysports.yahoo.com/${YAHOO_URL_PATHS[sport]}/`;
   }
   if (platform === 'sleeper') {
     return `sleeper.com/leagues/`;
@@ -68,11 +77,7 @@ function getUrlHint(sport: Sport, platform: string): string {
   if (platform === 'fantrax') {
     return `fantrax.com/fantasy/league/`;
   }
-  if (platform === 'cbs') {
-    return `cbssports.com/fantasy/league/`;
-  }
-  const sportPath = sport === 'basketball' ? 'basketball' : sport === 'football' ? 'football' : sport === 'hockey' ? 'hockey' : 'baseball';
-  return `espn.com/fantasy/${sportPath}/league?leagueId=`;
+  return `espn.com/fantasy/${sport}/league?leagueId=`;
 }
 
 export default function LeagueInput({ onSubmit, loading, isLoggedIn = false }: LeagueInputProps) {
@@ -87,8 +92,6 @@ export default function LeagueInput({ onSubmit, loading, isLoggedIn = false }: L
   const [error, setError] = useState('');
   const [yahooConnected, setYahooConnected] = useState(false);
   const [checkingYahoo, setCheckingYahoo] = useState(false);
-  const [cbsConnected, setCbsConnected] = useState(false);
-  const [checkingCbs, setCheckingCbs] = useState(false);
 
   // Check Yahoo connection status when user is logged in
   useEffect(() => {
@@ -98,17 +101,6 @@ export default function LeagueInput({ onSubmit, loading, isLoggedIn = false }: L
         .then(status => setYahooConnected(status.connected))
         .catch(() => setYahooConnected(false))
         .finally(() => setCheckingYahoo(false));
-    }
-  }, [isLoggedIn]);
-
-  // Check CBS connection status when user is logged in
-  useEffect(() => {
-    if (isLoggedIn) {
-      setCheckingCbs(true);
-      cbsApi.getConnectionStatus()
-        .then(status => setCbsConnected(status.connected))
-        .catch(() => setCbsConnected(false))
-        .finally(() => setCheckingCbs(false));
     }
   }, [isLoggedIn]);
 
@@ -124,7 +116,7 @@ export default function LeagueInput({ onSubmit, loading, isLoggedIn = false }: L
       setPlatform('espn');
     }
     // Reset platform to ESPN if switching to hockey while on unsupported platform
-    if (newSport === 'hockey' && !['cbs', 'espn', 'yahoo', 'fantrax'].includes(platform)) {
+    if (newSport === 'hockey' && !HOCKEY_PLATFORMS.includes(platform)) {
       setPlatform('espn');
     }
   };
@@ -189,8 +181,8 @@ export default function LeagueInput({ onSubmit, loading, isLoggedIn = false }: L
             <option value="basketball">Basketball</option>
             <option value="football">Football</option>
             <option value="baseball">Baseball</option>
-            <option value="hockey" disabled={!['cbs', 'espn', 'yahoo', 'fantrax'].includes(platform)}>
-              Hockey {!['cbs', 'espn', 'yahoo', 'fantrax'].includes(platform) ? '(Sleeper N/A)' : ''}
+            <option value="hockey" disabled={!HOCKEY_PLATFORMS.includes(platform)}>
+              Hockey {!HOCKEY_PLATFORMS.includes(platform) ? '(Sleeper N/A)' : ''}
             </option>
           </select>
         </div>
@@ -222,9 +214,6 @@ export default function LeagueInput({ onSubmit, loading, isLoggedIn = false }: L
             <option value="fantrax" disabled={false}>
               Fantrax
             </option>
-            <option value="cbs" disabled={!isLoggedIn}>
-              CBS Sports {!isLoggedIn ? '(Login Required)' : ''}
-            </option>
           </select>
         </div>
 
@@ -237,19 +226,6 @@ export default function LeagueInput({ onSubmit, loading, isLoggedIn = false }: L
             <YahooConnect
               compact
               onStatusChange={(connected) => setYahooConnected(connected)}
-            />
-          </div>
-        )}
-
-        {/* CBS connection prompt */}
-        {platform === 'cbs' && isLoggedIn && !cbsConnected && !checkingCbs && (
-          <div className="p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
-            <p className="text-sm text-yellow-800 mb-3">
-              Connect your CBS account to access your private leagues.
-            </p>
-            <CBSConnect
-              compact
-              onStatusChange={(connected) => setCbsConnected(connected)}
             />
           </div>
         )}
@@ -278,8 +254,6 @@ export default function LeagueInput({ onSubmit, loading, isLoggedIn = false }: L
               <>Find this in your Sleeper league URL: {getUrlHint(sport, platform)}<strong>XXXXXXXXXXXXXXXXXX</strong></>
             ) : platform === 'fantrax' ? (
               <>Find this in your Fantrax league URL: {getUrlHint(sport, platform)}<strong>XXXXXXXXXXXX</strong></>
-            ) : platform === 'cbs' ? (
-              <>Find this in your CBS league URL: {getUrlHint(sport, platform)}<strong>XXXXXXXXX</strong></>
             ) : (
               <>Find this in your ESPN league URL: {getUrlHint(sport, platform)}<strong>XXXXXXXXX</strong></>
             )}
@@ -321,7 +295,8 @@ export default function LeagueInput({ onSubmit, loading, isLoggedIn = false }: L
           <div className="p-3 bg-success-50 border border-green-200 rounded-lg text-green-700">
             <p className="font-medium">{validation.league_name}</p>
             <p className="text-sm">
-              {validation.num_divisions} divisions, {validation.playoff_spots} playoff spots
+              {validation.num_divisions ? `${validation.num_divisions} divisions, ` : ''}
+              {validation.playoff_spots} playoff spots
             </p>
             {season === 'auto' &&
               validation.season != null &&
@@ -340,7 +315,7 @@ export default function LeagueInput({ onSubmit, loading, isLoggedIn = false }: L
             <button
               type="button"
               onClick={handleValidate}
-              disabled={validating || loading || (platform === 'yahoo' && !yahooConnected) || (platform === 'cbs' && !cbsConnected)}
+              disabled={validating || loading || (platform === 'yahoo' && !yahooConnected)}
               className="flex-1 btn btn-secondary"
             >
               {validating ? 'Validating...' : 'Validate League'}
@@ -349,7 +324,7 @@ export default function LeagueInput({ onSubmit, loading, isLoggedIn = false }: L
 
           <button
             type="submit"
-            disabled={loading || validating || (!validation?.valid && !leagueId) || (platform === 'yahoo' && !yahooConnected) || (platform === 'cbs' && !cbsConnected)}
+            disabled={loading || validating || (!validation?.valid && !leagueId) || (platform === 'yahoo' && !yahooConnected)}
             className="flex-1 btn btn-primary"
           >
             {loading ? (

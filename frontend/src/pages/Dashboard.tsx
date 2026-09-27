@@ -1,7 +1,21 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
-import { leaguesApi, SavedLeague, User, simulationsApi } from '../api/client';
+import {
+  leaguesApi,
+  SavedLeague,
+  User,
+  simulationsApi,
+  getErrorMessage,
+  completeOAuthConnection,
+  oauthProviderFromState,
+} from '../api/client';
 import YahooConnect from '../components/YahooConnect';
+
+const PROVIDER_NAMES: Record<string, string> = { yahoo: 'Yahoo', cbs: 'CBS Sports' };
+
+function formatSeason(season: number, sport: string): string {
+  return sport === 'basketball' || sport === 'hockey' ? `${season - 1}-${season}` : `${season}`;
+}
 
 interface DashboardProps {
   user: User | null;
@@ -15,19 +29,50 @@ export default function Dashboard({ user }: DashboardProps) {
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [runningSimulation, setRunningSimulation] = useState<string | null>(null);
+  // Bumped after connecting an account so the connection card re-checks
+  const [connectionVersion, setConnectionVersion] = useState(0);
+  // An authorization code can only be exchanged once (StrictMode runs effects twice)
+  const handledCode = useRef<string | null>(null);
 
-  // Handle Yahoo OAuth callback params
+  // Handle the OAuth redirect back from Yahoo
   useEffect(() => {
-    const yahooConnected = searchParams.get('yahoo_connected');
-    const yahooError = searchParams.get('yahoo_error');
+    const code = searchParams.get('code');
+    const state = searchParams.get('state');
+    const providerError = searchParams.get('error_description') || searchParams.get('error');
 
-    if (yahooConnected === 'true') {
-      setSuccess('Yahoo account connected successfully!');
-      // Clear the query params
-      setSearchParams({});
-    } else if (yahooError) {
-      setError(`Yahoo connection error: ${yahooError}`);
-      setSearchParams({});
+    // Redirected straight here by the provider: forward code + state to the API
+    if (state && (code || providerError)) {
+      const provider = oauthProviderFromState(state);
+      const name = provider ? PROVIDER_NAMES[provider] : 'Account';
+      setSearchParams({}, { replace: true });
+
+      if (providerError || !provider || !code) {
+        setError(`${name} connection error: ${providerError || 'unrecognized response. Please try again.'}`);
+        return;
+      }
+      if (handledCode.current === code) return;
+      handledCode.current = code;
+
+      completeOAuthConnection(provider, code, state)
+        .then(() => {
+          setSuccess(`${name} account connected successfully!`);
+          setConnectionVersion((v) => v + 1);
+        })
+        .catch((err: unknown) => setError(getErrorMessage(err, `Failed to connect your ${name} account`)));
+      return;
+    }
+
+    // Redirected here by the API's own callback
+    for (const [provider, name] of Object.entries(PROVIDER_NAMES)) {
+      const connected = searchParams.get(`${provider}_connected`);
+      const failure = searchParams.get(`${provider}_error`);
+      if (connected === 'true') {
+        setSuccess(`${name} account connected successfully!`);
+        setSearchParams({}, { replace: true });
+      } else if (failure) {
+        setError(`${name} connection error: ${failure}`);
+        setSearchParams({}, { replace: true });
+      }
     }
   }, [searchParams, setSearchParams]);
 
@@ -39,7 +84,7 @@ export default function Dashboard({ user }: DashboardProps) {
 
     leaguesApi.getMyLeagues()
       .then(setLeagues)
-      .catch(() => setError('Failed to load saved leagues'))
+      .catch((err: unknown) => setError(getErrorMessage(err, 'Failed to load saved leagues')))
       .finally(() => setLoading(false));
   }, [user, navigate]);
 
@@ -62,15 +107,7 @@ export default function Dashboard({ user }: DashboardProps) {
       const task = await simulationsApi.run(league.platform, league.league_id, league.season, league.sport);
       navigate(`/results/${task.task_id}`);
     } catch (err: unknown) {
-      interface ErrorResponse {
-        response?: {
-          data?: {
-            detail?: string;
-          };
-        };
-      }
-      const errorResponse = err as ErrorResponse;
-      setError(errorResponse.response?.data?.detail || 'Failed to start simulation');
+      setError(getErrorMessage(err, 'Failed to start simulation'));
       setRunningSimulation(null);
     }
   };
@@ -93,7 +130,7 @@ export default function Dashboard({ user }: DashboardProps) {
 
       {/* Yahoo Connect Section */}
       <div className="mb-8">
-        <YahooConnect />
+        <YahooConnect key={connectionVersion} />
       </div>
 
       {success && (
@@ -145,7 +182,7 @@ export default function Dashboard({ user }: DashboardProps) {
                   {league.nickname || `League ${league.league_id}`}
                 </h3>
                 <p className="text-sm text-gray-600">
-                  {league.platform.toUpperCase()} {league.sport.charAt(0).toUpperCase() + league.sport.slice(1)} | {league.sport === 'basketball' ? `${league.season - 1}-${league.season}` : league.season} Season
+                  {league.platform.toUpperCase()} {league.sport.charAt(0).toUpperCase() + league.sport.slice(1)} | {formatSeason(league.season, league.sport)} Season
                 </p>
                 <p className="text-xs text-gray-500">
                   League ID: {league.league_id}

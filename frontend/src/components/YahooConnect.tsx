@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { yahooApi } from '../api/client';
+import { yahooApi, getErrorMessage } from '../api/client';
 
 interface YahooConnectProps {
   onStatusChange?: (connected: boolean) => void;
@@ -40,15 +40,7 @@ export default function YahooConnect({ onStatusChange, compact = false }: YahooC
       // Redirect to Yahoo OAuth
       window.location.href = url;
     } catch (err: unknown) {
-      interface ErrorResponse {
-        response?: {
-          data?: {
-            detail?: string;
-          };
-        };
-      }
-      const errorResponse = err as ErrorResponse;
-      setError(errorResponse.response?.data?.detail || 'Failed to start Yahoo connection');
+      setError(getErrorMessage(err, 'Failed to start Yahoo connection'));
       setActionLoading(false);
     }
   };
@@ -66,15 +58,7 @@ export default function YahooConnect({ onStatusChange, compact = false }: YahooC
       setConnected(false);
       onStatusChange?.(false);
     } catch (err: unknown) {
-      interface ErrorResponse {
-        response?: {
-          data?: {
-            detail?: string;
-          };
-        };
-      }
-      const errorResponse = err as ErrorResponse;
-      setError(errorResponse.response?.data?.detail || 'Failed to disconnect Yahoo account');
+      setError(getErrorMessage(err, 'Failed to disconnect Yahoo account'));
     } finally {
       setActionLoading(false);
     }

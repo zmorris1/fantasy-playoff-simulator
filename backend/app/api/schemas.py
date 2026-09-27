@@ -139,6 +139,7 @@ class TeamResult(BaseModel):
     clinched_first_seed: bool = False
     eliminated_division: bool = False
     eliminated_playoffs: bool = False
+    eliminated_first_seed: bool = False
 
 
 class SimulationResultsResponse(BaseModel):
