@@ -5,6 +5,7 @@ Fetches league data from Yahoo Fantasy API for basketball, football,
 and baseball leagues. Requires OAuth 2.0 authentication.
 """
 
+import asyncio
 import re
 import xml.etree.ElementTree as ET
 from collections import defaultdict
@@ -17,9 +18,11 @@ from .base import (
     PlatformAdapter,
     LeagueNotFoundError,
     LeaguePrivateError,
-    PlatformError
+    PlatformError,
+    UnsupportedLeagueError
 )
 from ..simulator.models import Team, Matchup, H2HDict
+from ..core.http import async_client
 from ..core.sports import Sport, YAHOO_GAME_KEYS
 from ..core.yahoo_oauth import refresh_access_token, YahooOAuthError, YahooTokenExpiredError
 from ..db.models import YahooCredential
@@ -30,6 +33,9 @@ class YahooAdapter(PlatformAdapter):
 
     BASE_URL = "https://fantasysports.yahooapis.com/fantasy/v2"
     XML_NS = {"yh": "http://fantasysports.yahooapis.com/fantasy/v2/base.rng"}
+
+    # Concurrent requests per adapter (Yahoo rate-limits aggressive clients)
+    MAX_CONCURRENT_REQUESTS = 4
 
     def __init__(
         self,
@@ -50,6 +56,10 @@ class YahooAdapter(PlatformAdapter):
         self.timeout = timeout
         self._access_token: Optional[str] = None
         self._token_refreshed = False
+        # Settings and weekly scoreboards are reused across fetch_* calls
+        self._settings_cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        self._scoreboard_cache: Dict[Tuple[str, int], Optional[ET.Element]] = {}
+        self._semaphore: Optional[asyncio.Semaphore] = None
 
     def _get_game_key(self) -> str:
         """Get the Yahoo game key for the current sport."""
@@ -66,8 +76,9 @@ class YahooAdapter(PlatformAdapter):
         Yahoo league keys have the format: {game_key}.l.{league_id}
         where game_key is sport-specific (e.g., nba, nfl, mlb)
 
-        For specific seasons, we need to look up the game_id first,
-        but for simplicity we'll use the current game key format.
+        The game code (e.g. "nba") always refers to Yahoo's current season,
+        so `season` is not used: past seasons would need Yahoo's numeric
+        game_id for that year.
         """
         game_key = self._get_game_key()
         return f"{game_key}.l.{league_id}"
@@ -88,7 +99,11 @@ class YahooAdapter(PlatformAdapter):
 
         # Check if token is expired or will expire soon (within 5 minutes)
         now = datetime.now(timezone.utc)
-        if self.credential.is_expired or (self.credential.expires_at - now).total_seconds() < 300:
+        expires_at = self.credential.expires_at
+        if expires_at.tzinfo is None:
+            # SQLite drops the timezone; stored values are UTC
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if self.credential.is_expired or (expires_at - now).total_seconds() < 300:
             if self._token_refreshed:
                 # Already tried to refresh, something is wrong
                 raise YahooTokenExpiredError("Token refresh failed. Please reconnect your Yahoo account.")
@@ -123,7 +138,7 @@ class YahooAdapter(PlatformAdapter):
         access_token = await self._ensure_valid_token()
         url = f"{self.BASE_URL}/{endpoint}"
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with async_client(self.timeout) as client:
             try:
                 response = await client.get(
                     url,
@@ -193,6 +208,122 @@ class YahooAdapter(PlatformAdapter):
         if results:
             return results
         return element.findall(path)
+
+    async def _settings(self, league_id: str, season: int) -> Dict[str, Any]:
+        """League settings, fetched once per adapter."""
+        key = (league_id, season)
+        if key not in self._settings_cache:
+            self._settings_cache[key] = await self._fetch_league_settings_internal(league_id, season)
+        return self._settings_cache[key]
+
+    async def _scoreboard(self, league_key: str, week: int) -> Optional[ET.Element]:
+        """A week's <scoreboard> element (None if missing), fetched once per adapter."""
+        cache_key = (league_key, week)
+        if cache_key not in self._scoreboard_cache:
+            if self._semaphore is None:
+                self._semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_REQUESTS)
+            async with self._semaphore:
+                root = await self._fetch_api(f"league/{league_key}/scoreboard;week={week}")
+            league = self._find_element(root, "league")
+            if league is None:
+                league = root
+            self._scoreboard_cache[cache_key] = self._find_element(league, "scoreboard")
+        return self._scoreboard_cache[cache_key]
+
+    async def _scoreboards(self, league_key: str, weeks: range) -> Dict[int, Optional[ET.Element]]:
+        """Scoreboards for several weeks, fetched concurrently; failed weeks are None."""
+        async def one(week: int) -> Optional[ET.Element]:
+            try:
+                return await self._scoreboard(league_key, week)
+            except PlatformError:
+                return None
+
+        results = await asyncio.gather(*(one(w) for w in weeks))
+        return dict(zip(weeks, results))
+
+    @staticmethod
+    def _team_id(team_key: str) -> Optional[int]:
+        """Team ID from a team_key ({game_key}.l.{league_id}.t.{team_id})."""
+        match = re.search(r'\.t\.(\d+)$', team_key or "")
+        return int(match.group(1)) if match else None
+
+    def _matchup_team_ids(self, matchup_elem: ET.Element) -> List[int]:
+        """Team IDs in a <matchup>, in listed order."""
+        teams_in_matchup = self._find_element(matchup_elem, "teams")
+        if teams_in_matchup is None:
+            return []
+        team_ids = []
+        for t_elem in self._find_all(teams_in_matchup, "team")[:2]:
+            team_id = self._team_id(self._find_text(t_elem, "team_key"))
+            if team_id is not None:
+                team_ids.append(team_id)
+        return team_ids
+
+    def _team_values(self, matchup_elem: ET.Element, *path: str) -> List[Optional[float]]:
+        """A numeric field (e.g. win_probability) for each team in a matchup."""
+        values: List[Optional[float]] = []
+        teams_in_matchup = self._find_element(matchup_elem, "teams")
+        if teams_in_matchup is None:
+            return values
+        for t_elem in self._find_all(teams_in_matchup, "team")[:2]:
+            elem: Optional[ET.Element] = t_elem
+            for part in path:
+                elem = self._find_element(elem, part) if elem is not None else None
+            try:
+                values.append(float(elem.text) if elem is not None and elem.text else None)
+            except ValueError:
+                values.append(None)
+        return values
+
+    def _matchup_result(self, matchup_elem: ET.Element, categories: int) -> Optional[Dict[int, int]]:
+        """
+        Units won in a completed matchup: {team1_id: n, team2_id: n, -1: ties}.
+        None if the result can't be determined.
+
+        Uses Yahoo's winner_team_key / is_tied (per category from stat_winners
+        in each-category leagues). Falls back to win_probability, then points.
+        """
+        team_ids = self._matchup_team_ids(matchup_elem)
+        if len(team_ids) < 2:
+            return None
+        team1_id, team2_id = team_ids[0], team_ids[1]
+        result = {team1_id: 0, team2_id: 0, -1: 0}
+
+        if categories > 1:
+            stat_winners = self._find_element(matchup_elem, "stat_winners")
+            if stat_winners is not None:
+                for stat_winner in self._find_all(stat_winners, "stat_winner"):
+                    if self._find_text(stat_winner, "is_tied") == "1":
+                        result[-1] += 1
+                        continue
+                    winner = self._team_id(self._find_text(stat_winner, "winner_team_key"))
+                    if winner in (team1_id, team2_id):
+                        result[winner] += 1
+                if sum(result.values()):
+                    return result
+
+        if self._find_text(matchup_elem, "is_tied") == "1":
+            result[-1] = 1
+            return result
+
+        winner = self._team_id(self._find_text(matchup_elem, "winner_team_key"))
+        if winner in (team1_id, team2_id):
+            result[winner] = 1
+            return result
+
+        # Older/partial responses: compare win_probability, then total points
+        for path in (("win_probability",), ("team_points", "total")):
+            values = self._team_values(matchup_elem, *path)
+            if len(values) == 2 and None not in values:
+                if values[0] > values[1]:
+                    result[team1_id] = 1
+                elif values[1] > values[0]:
+                    result[team2_id] = 1
+                else:
+                    result[-1] = 1
+                return result
+
+        return None
 
     async def validate_league(self, league_id: str, season: int) -> bool:
         """Validate that a league exists and is accessible."""
@@ -305,20 +436,14 @@ class YahooAdapter(PlatformAdapter):
         current_week = self._find_int(league, "current_week", 1)
 
         # Get total weeks from settings
-        settings = await self._fetch_league_settings_internal(league_id, season)
+        settings = await self._settings(league_id, season)
         total_weeks = settings.get("total_weeks", 18)
 
-        # Fetch all matchups
+        # Fetch matchups for the remaining weeks
         remaining: List[Matchup] = []
+        scoreboards = await self._scoreboards(league_key, range(current_week, total_weeks + 1))
 
-        # We need to fetch matchups for remaining weeks
-        for week in range(current_week, total_weeks + 1):
-            week_root = await self._fetch_api(f"league/{league_key}/scoreboard;week={week}")
-            week_league = self._find_element(week_root, "league")
-            if week_league is None:
-                week_league = week_root
-
-            scoreboard = self._find_element(week_league, "scoreboard")
+        for week, scoreboard in sorted(scoreboards.items()):
             if scoreboard is None:
                 continue
 
@@ -332,22 +457,7 @@ class YahooAdapter(PlatformAdapter):
                 if status.lower() in ("postevent", "postgame"):
                     continue
 
-                teams_in_matchup = self._find_element(matchup_elem, "teams")
-                if teams_in_matchup is None:
-                    continue
-
-                team_elems = self._find_all(teams_in_matchup, "team")
-                if len(team_elems) < 2:
-                    continue
-
-                # Extract team IDs
-                team_ids = []
-                for t_elem in team_elems[:2]:
-                    t_key = self._find_text(t_elem, "team_key")
-                    t_match = re.search(r'\.t\.(\d+)$', t_key)
-                    if t_match:
-                        team_ids.append(int(t_match.group(1)))
-
+                team_ids = self._matchup_team_ids(matchup_elem)
                 if len(team_ids) < 2:
                     continue
 
@@ -356,7 +466,7 @@ class YahooAdapter(PlatformAdapter):
                 # Check if division game
                 home_team = teams.get(home_id)
                 away_team = teams.get(away_id)
-                is_division_game = (
+                is_division_game = bool(
                     home_team and away_team and
                     home_team.division_id == away_team.division_id and
                     home_team.division_id != 0
@@ -383,24 +493,17 @@ class YahooAdapter(PlatformAdapter):
         league_key = self._build_league_key(league_id, season)
 
         # Get total weeks
-        settings = await self._fetch_league_settings_internal(league_id, season)
+        settings = await self._settings(league_id, season)
         total_weeks = settings.get("total_weeks", 18)
+        categories = settings.get("categories_per_matchup", 1)
 
         # Track H2H records
         h2h: Dict[Tuple[int, int], List[int]] = defaultdict(lambda: [0, 0, 0])
 
         # Fetch completed matchups for all weeks
-        for week in range(1, total_weeks + 1):
-            try:
-                week_root = await self._fetch_api(f"league/{league_key}/scoreboard;week={week}")
-            except PlatformError:
-                continue
+        scoreboards = await self._scoreboards(league_key, range(1, total_weeks + 1))
 
-            week_league = self._find_element(week_root, "league")
-            if week_league is None:
-                week_league = week_root
-
-            scoreboard = self._find_element(week_league, "scoreboard")
+        for scoreboard in scoreboards.values():
             if scoreboard is None:
                 continue
 
@@ -414,55 +517,14 @@ class YahooAdapter(PlatformAdapter):
                 if status.lower() not in ("postevent", "postgame"):
                     continue
 
-                teams_in_matchup = self._find_element(matchup_elem, "teams")
-                if teams_in_matchup is None:
+                result = self._matchup_result(matchup_elem, categories)
+                if result is None:
                     continue
 
-                team_elems = self._find_all(teams_in_matchup, "team")
-                if len(team_elems) < 2:
-                    continue
-
-                # Extract team IDs and results
-                results = []
-                for t_elem in team_elems[:2]:
-                    t_key = self._find_text(t_elem, "team_key")
-                    t_match = re.search(r'\.t\.(\d+)$', t_key)
-                    if not t_match:
-                        continue
-
-                    team_id = int(t_match.group(1))
-                    win_prob = self._find_text(t_elem, "win_probability", "0")
-
-                    # Determine winner based on win_probability (1.0 = won, 0.0 = lost, 0.5 = tie)
-                    try:
-                        prob = float(win_prob)
-                        results.append((team_id, prob))
-                    except ValueError:
-                        results.append((team_id, 0.0))
-
-                if len(results) < 2:
-                    continue
-
-                team1_id, team1_prob = results[0]
-                team2_id, team2_prob = results[1]
-
-                key = (min(team1_id, team2_id), max(team1_id, team2_id))
-
-                if team1_prob > team2_prob:
-                    # Team 1 won
-                    if team1_id < team2_id:
-                        h2h[key][0] += 1
-                    else:
-                        h2h[key][1] += 1
-                elif team2_prob > team1_prob:
-                    # Team 2 won
-                    if team2_id < team1_id:
-                        h2h[key][0] += 1
-                    else:
-                        h2h[key][1] += 1
-                else:
-                    # Tie
-                    h2h[key][2] += 1
+                low, high = sorted(tid for tid in result if tid != -1)
+                h2h[(low, high)][0] += result[low]
+                h2h[(low, high)][1] += result[high]
+                h2h[(low, high)][2] += result[-1]
 
         # Convert lists to tuples
         return {k: tuple(v) for k, v in h2h.items()}
@@ -487,6 +549,12 @@ class YahooAdapter(PlatformAdapter):
         playoff_team_count = 6
         num_divisions = 0
         total_weeks = 18
+        divisions_list = []
+        categories = 1
+
+        # "head" = H2H each category, "headone" = H2H most categories,
+        # "headpoint" = H2H points; "roto" and "point" have no matchups
+        scoring_type = self._find_text(league, "scoring_type", "")
 
         if settings_elem is not None:
             # Get playoff team count
@@ -495,7 +563,22 @@ class YahooAdapter(PlatformAdapter):
             # Get number of divisions
             divisions = self._find_element(settings_elem, "divisions")
             if divisions is not None:
-                num_divisions = len(self._find_all(divisions, "division"))
+                for div in self._find_all(divisions, "division"):
+                    div_id = self._find_int(div, "division_id", 0)
+                    div_name = self._find_text(div, "name", f"Division {div_id}")
+                    divisions_list.append({"id": div_id, "name": div_name})
+                num_divisions = len(divisions_list)
+
+            # Each-category leagues: one unit per scoring category
+            if scoring_type == "head":
+                stat_categories = self._find_element(settings_elem, "stat_categories")
+                stats = self._find_element(stat_categories, "stats") if stat_categories is not None else None
+                if stats is not None:
+                    scored = [
+                        stat for stat in self._find_all(stats, "stat")
+                        if self._find_text(stat, "is_only_display_stat") != "1"
+                    ]
+                    categories = max(1, len(scored))
 
             # Get regular season weeks
             # In Yahoo, num_playoff_weeks tells us playoffs length
@@ -508,6 +591,9 @@ class YahooAdapter(PlatformAdapter):
             "playoff_spots": playoff_team_count,
             "num_divisions": num_divisions,
             "total_weeks": total_weeks,
+            "divisions": divisions_list,
+            "scoring_type": scoring_type,
+            "categories_per_matchup": categories,
         }
 
     async def fetch_league_settings(
@@ -519,26 +605,12 @@ class YahooAdapter(PlatformAdapter):
         Returns:
             Dict with league settings
         """
-        settings = await self._fetch_league_settings_internal(league_id, season)
+        settings = await self._settings(league_id, season)
 
-        # Get division details
-        league_key = self._build_league_key(league_id, season)
-        root = await self._fetch_api(f"league/{league_key}/settings")
+        if settings.get("scoring_type") in ("roto", "point"):
+            raise UnsupportedLeagueError(
+                "This league uses rotisserie/total-points scoring. "
+                "Only head-to-head leagues have matchups to simulate."
+            )
 
-        league = self._find_element(root, "league")
-        if league is None:
-            league = root
-
-        settings_elem = self._find_element(league, "settings")
-        divisions_list = []
-
-        if settings_elem is not None:
-            divisions = self._find_element(settings_elem, "divisions")
-            if divisions is not None:
-                for div in self._find_all(divisions, "division"):
-                    div_id = self._find_int(div, "division_id", 0)
-                    div_name = self._find_text(div, "name", f"Division {div_id}")
-                    divisions_list.append({"id": div_id, "name": div_name})
-
-        settings["divisions"] = divisions_list
-        return settings
+        return dict(settings)

@@ -454,3 +454,114 @@ class TestYahooAdapterValidateLeague:
             result = await adapter.validate_league("12345", 2025)
 
         assert result is True
+
+
+def scoreboard_xml(matchups: str) -> ET.Element:
+    return ET.fromstring(f'''
+    <fantasy_content xmlns="http://fantasysports.yahooapis.com/fantasy/v2/base.rng">
+        <league><scoreboard><matchups>{matchups}</matchups></scoreboard></league>
+    </fantasy_content>''')
+
+
+def completed_matchup(extra: str, t1: int = 1, t2: int = 2, t1_extra: str = "", t2_extra: str = "") -> str:
+    return f'''
+    <matchup>
+        <status>postevent</status>
+        {extra}
+        <teams>
+            <team><team_key>nba.l.12345.t.{t1}</team_key>{t1_extra}</team>
+            <team><team_key>nba.l.12345.t.{t2}</team_key>{t2_extra}</team>
+        </teams>
+    </matchup>'''
+
+
+class TestYahooMatchupResults:
+    """Completed matchups are scored from Yahoo's winner fields."""
+
+    async def h2h_for(self, adapter, matchups: str, categories: int = 1):
+        root = scoreboard_xml(matchups)
+        settings = {"total_weeks": 1, "categories_per_matchup": categories}
+        with patch.object(adapter, '_fetch_api', return_value=root):
+            with patch.object(adapter, '_fetch_league_settings_internal', return_value=settings):
+                return await adapter.fetch_head_to_head("12345", 2025, {})
+
+    @pytest.mark.asyncio
+    async def test_winner_team_key_beats_stale_win_probability(self, adapter):
+        # win_probability is a projection; the recorded winner is authoritative
+        matchup = completed_matchup(
+            "<winner_team_key>nba.l.12345.t.2</winner_team_key>",
+            t1_extra="<win_probability>0.9</win_probability>",
+            t2_extra="<win_probability>0.1</win_probability>",
+        )
+        assert await self.h2h_for(adapter, matchup) == {(1, 2): (0, 1, 0)}
+
+    @pytest.mark.asyncio
+    async def test_is_tied(self, adapter):
+        matchup = completed_matchup("<is_tied>1</is_tied>")
+        assert await self.h2h_for(adapter, matchup) == {(1, 2): (0, 0, 1)}
+
+    @pytest.mark.asyncio
+    async def test_each_category_counts_stat_winners(self, adapter):
+        stat_winners = "".join(
+            f"<stat_winner><stat_id>{i}</stat_id><winner_team_key>nba.l.12345.t.{w}</winner_team_key></stat_winner>"
+            for i, w in enumerate([1, 1, 2, 1, 2])
+        ) + "<stat_winner><stat_id>9</stat_id><is_tied>1</is_tied></stat_winner>"
+        matchup = completed_matchup(
+            f"<winner_team_key>nba.l.12345.t.1</winner_team_key><stat_winners>{stat_winners}</stat_winners>"
+        )
+        assert await self.h2h_for(adapter, matchup, categories=6) == {(1, 2): (3, 2, 1)}
+
+    @pytest.mark.asyncio
+    async def test_scoreboards_are_fetched_once(self, adapter):
+        calls = []
+
+        def fetch(endpoint):
+            calls.append(endpoint)
+            return scoreboard_xml("")
+
+        with patch.object(adapter, '_fetch_api', side_effect=fetch):
+            with patch.object(adapter, '_fetch_league_settings_internal', return_value={"total_weeks": 3}):
+                await adapter.fetch_schedule("12345", 2025, {})
+                await adapter.fetch_head_to_head("12345", 2025, {})
+
+        scoreboard_calls = [c for c in calls if "week=" in c]
+        assert len(scoreboard_calls) == len(set(scoreboard_calls)) == 3
+
+
+class TestYahooScoringTypes:
+
+    def settings_root(self, scoring_type: str, stats: str = "") -> ET.Element:
+        return ET.fromstring(f'''
+        <fantasy_content xmlns="http://fantasysports.yahooapis.com/fantasy/v2/base.rng">
+            <league>
+                <name>Cats</name>
+                <scoring_type>{scoring_type}</scoring_type>
+                <end_week>20</end_week>
+                <settings>
+                    <num_playoff_weeks>3</num_playoff_weeks>
+                    <stat_categories><stats>{stats}</stats></stat_categories>
+                </settings>
+            </league>
+        </fantasy_content>''')
+
+    @pytest.mark.asyncio
+    async def test_each_category_league_counts_scored_categories(self, adapter):
+        stats = "".join(f"<stat><stat_id>{i}</stat_id></stat>" for i in range(9))
+        stats += "<stat><stat_id>99</stat_id><is_only_display_stat>1</is_only_display_stat></stat>"
+        with patch.object(adapter, '_fetch_api', return_value=self.settings_root("head", stats)):
+            settings = await adapter.fetch_league_settings("12345", 2025)
+        assert settings["categories_per_matchup"] == 9
+
+    @pytest.mark.asyncio
+    async def test_most_categories_league_is_one_win_per_matchup(self, adapter):
+        stats = "".join(f"<stat><stat_id>{i}</stat_id></stat>" for i in range(9))
+        with patch.object(adapter, '_fetch_api', return_value=self.settings_root("headone", stats)):
+            settings = await adapter.fetch_league_settings("12345", 2025)
+        assert settings["categories_per_matchup"] == 1
+
+    @pytest.mark.asyncio
+    async def test_roto_is_unsupported(self, adapter):
+        from app.platforms import UnsupportedLeagueError
+        with patch.object(adapter, '_fetch_api', return_value=self.settings_root("roto")):
+            with pytest.raises(UnsupportedLeagueError):
+                await adapter.fetch_league_settings("12345", 2025)

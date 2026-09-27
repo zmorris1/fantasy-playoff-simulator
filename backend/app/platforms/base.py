@@ -118,3 +118,8 @@ class LeaguePrivateError(Exception):
 class PlatformError(Exception):
     """Raised when there's an error communicating with the platform."""
     pass
+
+
+class UnsupportedLeagueError(PlatformError):
+    """Raised when a league exists but its format can't be simulated (e.g. roto)."""
+    pass

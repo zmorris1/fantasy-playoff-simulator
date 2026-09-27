@@ -11,7 +11,8 @@ from .base import (
     PlatformAdapter,
     LeagueNotFoundError,
     LeaguePrivateError,
-    PlatformError
+    PlatformError,
+    UnsupportedLeagueError
 )
 from .espn import ESPNAdapter
 from .yahoo import YahooAdapter
@@ -76,6 +77,7 @@ __all__ = [
     "LeagueNotFoundError",
     "LeaguePrivateError",
     "PlatformError",
+    "UnsupportedLeagueError",
     "ESPNAdapter",
     "YahooAdapter",
     "SleeperAdapter",

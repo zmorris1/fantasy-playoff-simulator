@@ -4,13 +4,13 @@ Repository classes for database operations.
 
 import json
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from uuid import uuid4
 
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .models import User, SavedLeague, SimulationCache, SimulationTask, YahooCredential, CBSCredential
+from .models import User, SavedLeague, SimulationCache, SimulationTask, YahooCredential, CBSCredential, as_utc
 
 
 class UserRepository:
@@ -173,6 +173,37 @@ class SimulationCacheRepository:
 
         return json.loads(cache_entry.results_json)
 
+    async def get_latest(
+        self,
+        platform: str,
+        league_id: str,
+        season: int,
+        sport: str = "basketball"
+    ) -> Optional[Tuple[dict, datetime]]:
+        """
+        Most recent unexpired results for a league, whatever the week.
+
+        Returns:
+            (parsed results, cached at) or None
+        """
+        result = await self.session.execute(
+            select(SimulationCache)
+            .where(
+                SimulationCache.platform == platform.lower(),
+                SimulationCache.league_id == league_id,
+                SimulationCache.season == season,
+                SimulationCache.sport == sport.lower()
+            )
+            .order_by(SimulationCache.created_at.desc())
+            .limit(1)
+        )
+        cache_entry = result.scalar_one_or_none()
+
+        if cache_entry is None or cache_entry.is_expired:
+            return None
+
+        return json.loads(cache_entry.results_json), as_utc(cache_entry.created_at)
+
     async def set(
         self,
         platform: str,
@@ -198,15 +229,14 @@ class SimulationCacheRepository:
         Returns:
             Created cache entry
         """
-        # Delete existing entry if present
+        # Keep one entry per league: drop any earlier week's results too
         await self.session.execute(
             delete(SimulationCache)
             .where(
                 SimulationCache.platform == platform.lower(),
                 SimulationCache.league_id == league_id,
                 SimulationCache.season == season,
-                SimulationCache.sport == sport.lower(),
-                SimulationCache.week == week
+                SimulationCache.sport == sport.lower()
             )
         )
 

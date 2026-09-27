@@ -5,9 +5,10 @@ Fetches league data from Sleeper's public API for fantasy football and basketbal
 Sleeper has a free, public, read-only API requiring no authentication.
 """
 
+import asyncio
 import httpx
 from collections import defaultdict
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any
 
 from .base import (
     PlatformAdapter,
@@ -15,6 +16,7 @@ from .base import (
     PlatformError
 )
 from ..simulator.models import Team, Matchup, H2HDict
+from ..core.http import async_client
 from ..core.sports import Sport, SLEEPER_SPORT_CODES
 
 
@@ -31,10 +33,12 @@ class SleeperAdapter(PlatformAdapter):
             sport: The sport type (football or basketball)
             timeout: HTTP request timeout in seconds
         """
-        if sport == Sport.BASEBALL:
-            raise ValueError("Sleeper does not support baseball leagues")
+        if sport not in SLEEPER_SPORT_CODES:
+            raise ValueError(f"Sleeper does not support {sport.value} leagues")
         self.sport = sport
         self.timeout = timeout
+        # Responses are reused across the fetch_* calls of one simulation
+        self._cache: Dict[str, Any] = {}
 
     def _get_sport_code(self) -> str:
         """Get the Sleeper API sport code for the current sport."""
@@ -60,7 +64,7 @@ class SleeperAdapter(PlatformAdapter):
         """
         url = f"{self.BASE_URL}{endpoint}"
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with async_client(self.timeout) as client:
             try:
                 response = await client.get(url)
 
@@ -79,16 +83,74 @@ class SleeperAdapter(PlatformAdapter):
             except httpx.RequestError as e:
                 raise PlatformError(f"Network error: {e}")
 
+    async def _get(self, endpoint: str) -> Any:
+        """_fetch_json, memoized for the lifetime of this adapter."""
+        if endpoint not in self._cache:
+            self._cache[endpoint] = await self._fetch_json(endpoint)
+        return self._cache[endpoint]
+
     async def _get_nfl_state(self) -> Dict[str, Any]:
-        """Get the current NFL state including current week."""
-        return await self._fetch_json(f"/state/{self._get_sport_code()}")
+        """Get the sport's current state (season, week)."""
+        return await self._get(f"/state/{self._get_sport_code()}")
+
+    async def _get_league(self, league_id: str) -> Dict[str, Any]:
+        league = await self._get(f"/league/{league_id}")
+        if not league:
+            raise LeagueNotFoundError(f"League {league_id} not found")
+        return league
+
+    async def _week_bounds(self, league_id: str) -> Tuple[int, int, int]:
+        """
+        (first regular-season week, last week reflected in the standings,
+        last regular-season week) for a league.
+
+        Uses the league's own last_scored_leg rather than the sport-wide
+        current week: during a week in progress, matchups already have
+        partial points but the standings don't include them yet.
+        """
+        league = await self._get_league(league_id)
+        settings = league.get("settings") or {}
+
+        start_week = settings.get("start_week") or 1
+        last_regular = (settings.get("playoff_week_start") or 15) - 1
+
+        if league.get("status") == "complete":
+            last_scored = last_regular
+        elif settings.get("last_scored_leg") is not None:
+            last_scored = settings["last_scored_leg"]
+        else:
+            state = await self._get_nfl_state()
+            last_scored = (state.get("week") or 1) - 1
+
+        last_scored = max(start_week - 1, min(last_scored, last_regular))
+        return start_week, last_scored, last_regular
+
+    async def _get_week(self, league_id: str, week: int) -> List[Dict[str, Any]]:
+        try:
+            return await self._get(f"/league/{league_id}/matchups/{week}") or []
+        except (LeagueNotFoundError, PlatformError):
+            # Skip weeks that don't have data
+            return []
+
+    async def _get_weeks(self, league_id: str, weeks: range) -> Dict[int, List[Dict[str, Any]]]:
+        """Matchups for several weeks, fetched concurrently."""
+        results = await asyncio.gather(*(self._get_week(league_id, w) for w in weeks))
+        return dict(zip(weeks, results))
+
+    @staticmethod
+    def _pairs(matchups: List[Dict[str, Any]]) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        """Group a week's matchup rows into (team1, team2) pairs."""
+        groups: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        for m in matchups:
+            matchup_id = m.get("matchup_id")
+            if matchup_id is not None:
+                groups[matchup_id].append(m)
+        return [(g[0], g[1]) for g in groups.values() if len(g) == 2]
 
     async def validate_league(self, league_id: str, season: int) -> bool:
         """Validate that a league exists and is accessible."""
         try:
-            league = await self._fetch_json(f"/league/{league_id}")
-            if league is None:
-                raise LeagueNotFoundError(f"League {league_id} not found")
+            league = await self._get_league(league_id)
 
             # Check if the league is for the correct season
             league_season = league.get("season")
@@ -112,10 +174,11 @@ class SleeperAdapter(PlatformAdapter):
         Returns:
             Tuple of (teams dict by id, division names dict)
         """
-        # Fetch rosters and users in parallel
-        rosters = await self._fetch_json(f"/league/{league_id}/rosters")
-        users = await self._fetch_json(f"/league/{league_id}/users")
-        league = await self._fetch_json(f"/league/{league_id}")
+        rosters, users, league = await asyncio.gather(
+            self._get(f"/league/{league_id}/rosters"),
+            self._get(f"/league/{league_id}/users"),
+            self._get_league(league_id),
+        )
 
         if not rosters:
             raise LeagueNotFoundError(f"No rosters found for league {league_id}")
@@ -131,13 +194,14 @@ class SleeperAdapter(PlatformAdapter):
                 display_name = user.get("display_name")
                 user_names[user_id] = team_name or display_name or f"Team {user_id}"
 
-        # Get division names from league settings
+        # Division names live in league metadata as division_1, division_2, ...
         division_names: Dict[int, str] = {}
-        settings = league.get("settings", {}) if league else {}
-        divisions = settings.get("divisions", 0)
+        settings = league.get("settings") or {}
+        league_metadata = league.get("metadata") or {}
+        divisions = settings.get("divisions") or 0
         # Sleeper uses 1-indexed division IDs
         for i in range(1, divisions + 1):
-            division_names[i] = f"Division {i}"
+            division_names[i] = league_metadata.get(f"division_{i}") or f"Division {i}"
 
         # Build teams dict
         teams: Dict[int, Team] = {}
@@ -150,12 +214,12 @@ class SleeperAdapter(PlatformAdapter):
 
             # Get record from roster settings
             roster_settings = roster.get("settings", {}) or {}
-            wins = roster_settings.get("wins", 0)
-            losses = roster_settings.get("losses", 0)
-            ties = roster_settings.get("ties", 0)
+            wins = roster_settings.get("wins", 0) or 0
+            losses = roster_settings.get("losses", 0) or 0
+            ties = roster_settings.get("ties", 0) or 0
 
-            # Division info
-            division_id = roster_settings.get("division", 0)
+            # Division info (null when the league has no divisions)
+            division_id = roster_settings.get("division") or 0
 
             # Note: Sleeper doesn't provide division-specific records directly
             # We'll need to calculate them from matchup history if needed
@@ -182,66 +246,34 @@ class SleeperAdapter(PlatformAdapter):
         self, league_id: str, teams: Dict[int, Team]
     ) -> None:
         """Calculate division records by iterating through completed matchups."""
-        league = await self._fetch_json(f"/league/{league_id}")
-        settings = league.get("settings", {}) if league else {}
+        start_week, last_scored, _ = await self._week_bounds(league_id)
+        weeks = await self._get_weeks(league_id, range(start_week, last_scored + 1))
 
-        # Get playoff start week to know when regular season ends
-        playoff_week_start = settings.get("playoff_week_start", 15)
+        for matchups in weeks.values():
+            for team1_data, team2_data in self._pairs(matchups):
+                team1 = teams.get(team1_data.get("roster_id"))
+                team2 = teams.get(team2_data.get("roster_id"))
 
-        # Get current week
-        state = await self._get_nfl_state()
-        current_week = state.get("week", 1)
-
-        # Iterate through completed weeks
-        for week in range(1, min(current_week, playoff_week_start)):
-            try:
-                matchups = await self._fetch_json(f"/league/{league_id}/matchups/{week}")
-                if not matchups:
+                if not team1 or not team2:
                     continue
 
-                # Group matchups by matchup_id
-                matchup_groups: Dict[int, List[Dict]] = defaultdict(list)
-                for m in matchups:
-                    matchup_id = m.get("matchup_id")
-                    if matchup_id is not None:
-                        matchup_groups[matchup_id].append(m)
+                # Check if it's a division game
+                if team1.division_id != team2.division_id or team1.division_id == 0:
+                    continue
 
-                # Process each matchup
-                for matchup_id, group in matchup_groups.items():
-                    if len(group) != 2:
-                        continue
+                # Determine winner by points
+                team1_points = team1_data.get("points", 0) or 0
+                team2_points = team2_data.get("points", 0) or 0
 
-                    team1_data, team2_data = group[0], group[1]
-                    team1_id = team1_data.get("roster_id")
-                    team2_id = team2_data.get("roster_id")
-
-                    team1 = teams.get(team1_id)
-                    team2 = teams.get(team2_id)
-
-                    if not team1 or not team2:
-                        continue
-
-                    # Check if it's a division game
-                    if team1.division_id != team2.division_id or team1.division_id == 0:
-                        continue
-
-                    # Determine winner by points
-                    team1_points = team1_data.get("points", 0) or 0
-                    team2_points = team2_data.get("points", 0) or 0
-
-                    if team1_points > team2_points:
-                        team1.division_wins += 1
-                        team2.division_losses += 1
-                    elif team2_points > team1_points:
-                        team2.division_wins += 1
-                        team1.division_losses += 1
-                    else:
-                        team1.division_ties += 1
-                        team2.division_ties += 1
-
-            except (LeagueNotFoundError, PlatformError):
-                # Skip weeks that don't have data
-                continue
+                if team1_points > team2_points:
+                    team1.division_wins += 1
+                    team2.division_losses += 1
+                elif team2_points > team1_points:
+                    team2.division_wins += 1
+                    team1.division_losses += 1
+                else:
+                    team1.division_ties += 1
+                    team2.division_ties += 1
 
     async def fetch_schedule(
         self, league_id: str, season: int, teams: Dict[int, Team]
@@ -249,75 +281,41 @@ class SleeperAdapter(PlatformAdapter):
         """
         Fetch schedule from Sleeper API and identify remaining matchups.
 
+        Every matchup after the last scored week is remaining, including
+        the week in progress (its partial points aren't in the standings).
+
         Returns:
             Tuple of (remaining matchups, current week, total weeks)
         """
-        league = await self._fetch_json(f"/league/{league_id}")
-        settings = league.get("settings", {}) if league else {}
-
-        # Get playoff week start (regular season ends before this)
-        playoff_week_start = settings.get("playoff_week_start", 15)
-        total_weeks = playoff_week_start - 1
-
-        # Get current week from NFL state
-        state = await self._get_nfl_state()
-        current_week = state.get("week", 1)
+        _, last_scored, total_weeks = await self._week_bounds(league_id)
+        current_week = min(last_scored + 1, total_weeks)
+        weeks = await self._get_weeks(league_id, range(last_scored + 1, total_weeks + 1))
 
         # Build list of remaining matchups
         remaining: List[Matchup] = []
 
-        for week in range(current_week, total_weeks + 1):
-            try:
-                matchups = await self._fetch_json(f"/league/{league_id}/matchups/{week}")
-                if not matchups:
+        for week, matchups in sorted(weeks.items()):
+            for team1_data, team2_data in self._pairs(matchups):
+                team1_id = team1_data.get("roster_id")
+                team2_id = team2_data.get("roster_id")
+
+                if team1_id is None or team2_id is None:
                     continue
 
-                # Group matchups by matchup_id
-                matchup_groups: Dict[int, List[Dict]] = defaultdict(list)
-                for m in matchups:
-                    matchup_id = m.get("matchup_id")
-                    if matchup_id is not None:
-                        matchup_groups[matchup_id].append(m)
+                team1 = teams.get(team1_id)
+                team2 = teams.get(team2_id)
+                is_division_game = bool(
+                    team1 and team2 and
+                    team1.division_id == team2.division_id and
+                    team1.division_id != 0
+                )
 
-                # Process each matchup
-                for matchup_id, group in matchup_groups.items():
-                    if len(group) != 2:
-                        continue
-
-                    team1_data, team2_data = group[0], group[1]
-                    team1_id = team1_data.get("roster_id")
-                    team2_id = team2_data.get("roster_id")
-
-                    if team1_id is None or team2_id is None:
-                        continue
-
-                    # Check if matchup is completed (both have points > 0)
-                    team1_points = team1_data.get("points", 0) or 0
-                    team2_points = team2_data.get("points", 0) or 0
-
-                    # If both teams have 0 points, matchup hasn't been played
-                    # or if either team has non-zero points, check week completion
-                    # For simplicity, treat current week matchups with 0-0 as remaining
-                    if team1_points == 0 and team2_points == 0:
-                        # Matchup not played yet
-                        team1 = teams.get(team1_id)
-                        team2 = teams.get(team2_id)
-                        is_division_game = (
-                            team1 and team2 and
-                            team1.division_id == team2.division_id and
-                            team1.division_id != 0
-                        )
-
-                        remaining.append(Matchup(
-                            home_team_id=team1_id,
-                            away_team_id=team2_id,
-                            week=week,
-                            is_division_game=is_division_game
-                        ))
-
-            except (LeagueNotFoundError, PlatformError):
-                # Skip weeks that don't have data
-                continue
+                remaining.append(Matchup(
+                    home_team_id=team1_id,
+                    away_team_id=team2_id,
+                    week=week,
+                    is_division_game=is_division_game
+                ))
 
         return remaining, current_week, total_weeks
 
@@ -330,74 +328,46 @@ class SleeperAdapter(PlatformAdapter):
         Returns:
             Dict mapping (team1_id, team2_id) -> (team1_wins, team2_wins, ties)
         """
-        league = await self._fetch_json(f"/league/{league_id}")
-        settings = league.get("settings", {}) if league else {}
-
-        # Get playoff week start (regular season ends before this)
-        playoff_week_start = settings.get("playoff_week_start", 15)
-
-        # Get current week from NFL state
-        state = await self._get_nfl_state()
-        current_week = state.get("week", 1)
+        start_week, last_scored, _ = await self._week_bounds(league_id)
+        weeks = await self._get_weeks(league_id, range(start_week, last_scored + 1))
 
         # Track H2H records
         h2h: Dict[Tuple[int, int], List[int]] = defaultdict(lambda: [0, 0, 0])
 
-        # Iterate through completed weeks only
-        for week in range(1, min(current_week, playoff_week_start)):
-            try:
-                matchups = await self._fetch_json(f"/league/{league_id}/matchups/{week}")
-                if not matchups:
+        # Completed weeks only
+        for matchups in weeks.values():
+            for team1_data, team2_data in self._pairs(matchups):
+                team1_id = team1_data.get("roster_id")
+                team2_id = team2_data.get("roster_id")
+
+                if team1_id is None or team2_id is None:
                     continue
 
-                # Group matchups by matchup_id
-                matchup_groups: Dict[int, List[Dict]] = defaultdict(list)
-                for m in matchups:
-                    matchup_id = m.get("matchup_id")
-                    if matchup_id is not None:
-                        matchup_groups[matchup_id].append(m)
+                team1_points = team1_data.get("points", 0) or 0
+                team2_points = team2_data.get("points", 0) or 0
 
-                # Process each matchup
-                for matchup_id, group in matchup_groups.items():
-                    if len(group) != 2:
-                        continue
+                # Skip unplayed matchups
+                if team1_points == 0 and team2_points == 0:
+                    continue
 
-                    team1_data, team2_data = group[0], group[1]
-                    team1_id = team1_data.get("roster_id")
-                    team2_id = team2_data.get("roster_id")
+                # Use consistent key ordering (min_id, max_id)
+                key = (min(team1_id, team2_id), max(team1_id, team2_id))
 
-                    if team1_id is None or team2_id is None:
-                        continue
-
-                    team1_points = team1_data.get("points", 0) or 0
-                    team2_points = team2_data.get("points", 0) or 0
-
-                    # Skip unplayed matchups
-                    if team1_points == 0 and team2_points == 0:
-                        continue
-
-                    # Use consistent key ordering (min_id, max_id)
-                    key = (min(team1_id, team2_id), max(team1_id, team2_id))
-
-                    if team1_points > team2_points:
-                        # team1 won
-                        if team1_id < team2_id:
-                            h2h[key][0] += 1
-                        else:
-                            h2h[key][1] += 1
-                    elif team2_points > team1_points:
-                        # team2 won
-                        if team2_id < team1_id:
-                            h2h[key][0] += 1
-                        else:
-                            h2h[key][1] += 1
+                if team1_points > team2_points:
+                    # team1 won
+                    if team1_id < team2_id:
+                        h2h[key][0] += 1
                     else:
-                        # Tie
-                        h2h[key][2] += 1
-
-            except (LeagueNotFoundError, PlatformError):
-                # Skip weeks that don't have data
-                continue
+                        h2h[key][1] += 1
+                elif team2_points > team1_points:
+                    # team2 won
+                    if team2_id < team1_id:
+                        h2h[key][0] += 1
+                    else:
+                        h2h[key][1] += 1
+                else:
+                    # Tie
+                    h2h[key][2] += 1
 
         # Convert lists to tuples
         return {k: tuple(v) for k, v in h2h.items()}
@@ -411,17 +381,15 @@ class SleeperAdapter(PlatformAdapter):
         Returns:
             Dict with league settings
         """
-        league = await self._fetch_json(f"/league/{league_id}")
-
-        if not league:
-            raise LeagueNotFoundError(f"League {league_id} not found")
+        league = await self._get_league(league_id)
 
         settings = league.get("settings", {}) or {}
+        league_metadata = league.get("metadata") or {}
 
         # Get playoff settings
         playoff_teams = settings.get("playoff_teams", 6)
-        divisions = settings.get("divisions", 0)
-        playoff_week_start = settings.get("playoff_week_start", 15)
+        divisions = settings.get("divisions") or 0
+        playoff_week_start = settings.get("playoff_week_start") or 15
         total_weeks = playoff_week_start - 1
 
         # Get league name
@@ -430,12 +398,15 @@ class SleeperAdapter(PlatformAdapter):
         # Build division list
         division_list = []
         for i in range(1, divisions + 1):
-            division_list.append({"id": i, "name": f"Division {i}"})
+            name = league_metadata.get(f"division_{i}") or f"Division {i}"
+            division_list.append({"id": i, "name": name})
 
         return {
             "league_name": league_name,
             "playoff_spots": playoff_teams,
             "num_divisions": divisions,
             "total_weeks": total_weeks,
-            "divisions": division_list
+            "divisions": division_list,
+            # Extra weekly game vs. the league median (not simulated)
+            "median_games": bool(settings.get("league_average_match")),
         }

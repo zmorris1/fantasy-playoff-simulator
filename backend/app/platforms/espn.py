@@ -13,9 +13,11 @@ from .base import (
     PlatformAdapter,
     LeagueNotFoundError,
     LeaguePrivateError,
-    PlatformError
+    PlatformError,
+    UnsupportedLeagueError
 )
 from ..simulator.models import Team, Matchup, H2HDict
+from ..core.http import async_client
 from ..core.sports import Sport, ESPN_SPORT_CODES
 
 
@@ -23,6 +25,9 @@ class ESPNAdapter(PlatformAdapter):
     """ESPN Fantasy platform adapter supporting basketball, football, and baseball."""
 
     BASE_URL = "https://lm-api-reads.fantasy.espn.com/apis/v3/games/{sport_code}/seasons/{season}/segments/0/leagues/{league_id}"
+
+    # Every view the adapter needs; fetched together once per league/season
+    ALL_VIEWS = ["mTeam", "mSettings", "mStandings", "mMatchup"]
 
     def __init__(self, sport: Sport = Sport.BASKETBALL, timeout: float = 30.0):
         """
@@ -34,6 +39,7 @@ class ESPNAdapter(PlatformAdapter):
         """
         self.sport = sport
         self.timeout = timeout
+        self._cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
     def _get_sport_code(self) -> str:
         """Get the ESPN API sport code for the current sport."""
@@ -73,7 +79,7 @@ class ESPNAdapter(PlatformAdapter):
         url = self._get_url(league_id, season)
         params = {"view": views}
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with async_client(self.timeout) as client:
             try:
                 response = await client.get(url, params=params)
 
@@ -95,6 +101,28 @@ class ESPNAdapter(PlatformAdapter):
             except httpx.RequestError as e:
                 raise PlatformError(f"Network error: {e}")
 
+    async def _get_league(self, league_id: str, season: int) -> Dict[str, Any]:
+        """All league data (every view), fetched once and reused."""
+        key = (league_id, season)
+        if key not in self._cache:
+            self._cache[key] = await self._fetch_league_data(league_id, season, self.ALL_VIEWS)
+        return self._cache[key]
+
+    @staticmethod
+    def _scoring(data: Dict[str, Any]) -> Tuple[str, int]:
+        """
+        (scoring type, categories per matchup) for a league.
+
+        "Each category" leagues (H2H_CATEGORY) count every category as a win
+        or loss in the standings, so a matchup is worth one unit per category.
+        Points and most-categories leagues award one win per matchup.
+        """
+        scoring = data.get("settings", {}).get("scoringSettings", {})
+        scoring_type = scoring.get("scoringType") or "H2H_POINTS"
+        if scoring_type == "H2H_CATEGORY":
+            return scoring_type, max(1, len(scoring.get("scoringItems", [])))
+        return scoring_type, 1
+
     async def validate_league(self, league_id: str, season: int) -> bool:
         """Validate that a league exists and is accessible."""
         try:
@@ -114,9 +142,7 @@ class ESPNAdapter(PlatformAdapter):
         Returns:
             Tuple of (teams dict by id, division names dict)
         """
-        data = await self._fetch_league_data(
-            league_id, season, ["mTeam", "mSettings", "mStandings"]
-        )
+        data = await self._get_league(league_id, season)
 
         # Get division names from settings
         division_names = {}
@@ -169,9 +195,7 @@ class ESPNAdapter(PlatformAdapter):
         Returns:
             Tuple of (remaining matchups, current week, total weeks)
         """
-        data = await self._fetch_league_data(
-            league_id, season, ["mMatchup", "mSettings"]
-        )
+        data = await self._get_league(league_id, season)
 
         # Get season info from settings
         settings = data.get("settings", {})
@@ -182,7 +206,9 @@ class ESPNAdapter(PlatformAdapter):
 
         # Get current week from status
         status = data.get("status", {})
-        current_week = status.get("currentMatchupPeriod", 1)
+        # currentMatchupPeriod keeps counting through the playoffs; cap it at
+        # the regular season (playoff weeks are never simulated)
+        current_week = min(status.get("currentMatchupPeriod", 1), total_weeks)
 
         schedule = data.get("schedule", [])
 
@@ -207,7 +233,7 @@ class ESPNAdapter(PlatformAdapter):
             # Check if this is a division game
             home_team = teams.get(home_id)
             away_team = teams.get(away_id)
-            is_division_game = (
+            is_division_game = bool(
                 home_team and away_team and
                 home_team.division_id == away_team.division_id
             )
@@ -233,8 +259,9 @@ class ESPNAdapter(PlatformAdapter):
         Returns:
             Dict mapping (team1_id, team2_id) -> (team1_wins, team2_wins, ties)
         """
-        data = await self._fetch_league_data(league_id, season, ["mMatchup", "mSettings"])
+        data = await self._get_league(league_id, season)
         schedule = data.get("schedule", [])
+        _, categories = self._scoring(data)
 
         # Get regular season week count to filter out playoff matchups
         settings = data.get("settings", {})
@@ -258,6 +285,22 @@ class ESPNAdapter(PlatformAdapter):
             winner = matchup.get("winner")
 
             if home_id is None or away_id is None:
+                continue
+
+            # Each-category leagues: H2H counts categories, like the standings
+            if categories > 1 and winner in ("HOME", "AWAY", "TIE"):
+                home_cats = home.get("cumulativeScore") or {}
+                cat_wins = home_cats.get("wins", 0)
+                cat_losses = home_cats.get("losses", 0)
+                cat_ties = home_cats.get("ties", 0)
+                key = (min(home_id, away_id), max(home_id, away_id))
+                if home_id < away_id:
+                    h2h[key][0] += cat_wins
+                    h2h[key][1] += cat_losses
+                else:
+                    h2h[key][0] += cat_losses
+                    h2h[key][1] += cat_wins
+                h2h[key][2] += cat_ties
                 continue
 
             # Determine matchup result
@@ -291,10 +334,17 @@ class ESPNAdapter(PlatformAdapter):
         Returns:
             Dict with league settings
         """
-        data = await self._fetch_league_data(league_id, season, ["mSettings"])
+        data = await self._get_league(league_id, season)
 
         settings = data.get("settings", {})
         schedule_settings = settings.get("scheduleSettings", {})
+        scoring_type, categories = self._scoring(data)
+
+        if "ROTO" in scoring_type or scoring_type.startswith("TOTAL"):
+            raise UnsupportedLeagueError(
+                f"This league uses {scoring_type.replace('_', ' ').title()} scoring. "
+                "Only head-to-head leagues have matchups to simulate."
+            )
 
         # Get playoff settings
         playoff_team_count = schedule_settings.get("playoffTeamCount", 6)
@@ -309,6 +359,8 @@ class ESPNAdapter(PlatformAdapter):
             "playoff_spots": playoff_team_count,
             "num_divisions": len(divisions),
             "total_weeks": matchup_period_count,
+            "scoring_type": scoring_type,
+            "categories_per_matchup": categories,
             "divisions": [
                 {"id": d["id"], "name": d.get("name", f"Division {d['id']}")}
                 for d in divisions
