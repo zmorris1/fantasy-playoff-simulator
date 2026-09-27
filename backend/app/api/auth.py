@@ -2,7 +2,9 @@
 Authentication utilities for JWT-based auth.
 """
 
+import logging
 import os
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -15,8 +17,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..db import get_db, UserRepository, User
 
 
+logger = logging.getLogger("app")
+
 # JWT Configuration
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "dev-secret-key-change-in-production")
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "")
+if not SECRET_KEY:
+    # Never fall back to a well-known key: anyone could forge tokens with it.
+    # A random key is safe but logs everyone out whenever the server restarts.
+    SECRET_KEY = secrets.token_urlsafe(48)
+    logger.warning(
+        "JWT_SECRET_KEY is not set; using a random key for this process. "
+        "Set JWT_SECRET_KEY so logins survive restarts."
+    )
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))  # 24 hours
 
@@ -24,15 +36,21 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440
 security = HTTPBearer(auto_error=False)
 
 
+def _password_bytes(password: str) -> bytes:
+    # bcrypt only uses the first 72 bytes. bcrypt 4 truncated silently and
+    # bcrypt 5 raises, so truncate explicitly to keep old hashes verifiable.
+    return password.encode('utf-8')[:72]
+
+
 def hash_password(password: str) -> str:
     """Hash a password using bcrypt."""
     salt = bcrypt.gensalt()
-    return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
+    return bcrypt.hashpw(_password_bytes(password), salt).decode('utf-8')
 
 
 def verify_password(password: str, password_hash: str) -> bool:
     """Verify a password against its hash."""
-    return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
+    return bcrypt.checkpw(_password_bytes(password), password_hash.encode('utf-8'))
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
@@ -74,12 +92,14 @@ async def get_current_user(
     if payload is None:
         return None
 
-    user_id = payload.get("sub")
-    if user_id is None:
+    try:
+        user_id = int(payload["sub"])
+    except (KeyError, TypeError, ValueError):
+        # Not a login token (e.g. an OAuth state) or malformed
         return None
 
     user_repo = UserRepository(db)
-    user = await user_repo.get_by_id(int(user_id))
+    user = await user_repo.get_by_id(user_id)
     return user
 
 

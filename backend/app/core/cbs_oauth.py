@@ -13,6 +13,8 @@ from urllib.parse import urlencode
 
 import httpx
 
+from .http import async_client
+
 
 class CBSOAuthError(Exception):
     """Raised when there's an error with CBS OAuth."""
@@ -94,7 +96,7 @@ async def exchange_code_for_tokens(code: str) -> dict:
         "grant_type": "authorization_code",
     }
 
-    async with httpx.AsyncClient() as client:
+    async with async_client() as client:
         try:
             response = await client.post(
                 CBS_TOKEN_URL,
@@ -151,7 +153,7 @@ async def refresh_access_token(refresh_token: str) -> dict:
         "grant_type": "refresh_token",
     }
 
-    async with httpx.AsyncClient() as client:
+    async with async_client() as client:
         try:
             response = await client.post(
                 CBS_TOKEN_URL,

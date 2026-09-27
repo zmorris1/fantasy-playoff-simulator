@@ -15,12 +15,32 @@ from ..schemas import (
 from ..auth import get_current_user, get_current_user_required
 from ...db import get_db, SavedLeagueRepository, YahooCredentialRepository, CBSCredentialRepository, User
 from ...platforms import get_adapter, LeagueNotFoundError, LeaguePrivateError, PlatformError
-from ...core.sports import Sport, get_current_season
+from ...core.sports import Sport, get_season_candidates
 from ...core.yahoo_oauth import YahooTokenExpiredError
 from ...core.cbs_oauth import CBSTokenExpiredError
 
 
 router = APIRouter(prefix="/leagues", tags=["leagues"])
+
+
+async def validate_with_season_fallback(adapter, league_id: str, season_candidates: List[int]):
+    """
+    Try each candidate season in order; return (settings, season) for the
+    first one that exists.
+
+    Raises LeagueNotFoundError only if every candidate is missing. Other
+    errors (private league, expired tokens, platform failures) propagate
+    immediately rather than being masked by a fallback attempt.
+    """
+    last_not_found = None
+    for candidate in season_candidates:
+        try:
+            await adapter.validate_league(league_id, candidate)
+            settings = await adapter.fetch_league_settings(league_id, candidate)
+            return settings, candidate
+        except LeagueNotFoundError as e:
+            last_not_found = e
+    raise last_not_found
 
 
 @router.get("/validate", response_model=LeagueValidateResponse)
@@ -47,8 +67,12 @@ async def validate_league(
             error=f"Invalid sport: {sport}. Supported: basketball, football, baseball, hockey"
         )
 
-    if season is None:
-        season = get_current_season(sport_enum)
+    # An explicitly chosen season is honored exactly; otherwise fall back
+    # to the prior season when the current one doesn't exist yet (off-season)
+    if season is not None:
+        season_candidates = [season]
+    else:
+        season_candidates = get_season_candidates(sport_enum)
 
     # Handle Yahoo platform - requires authentication and Yahoo credential
     yahoo_credential = None
@@ -93,8 +117,9 @@ async def validate_league(
         )
 
     try:
-        await adapter.validate_league(league_id, season)
-        settings = await adapter.fetch_league_settings(league_id, season)
+        settings, resolved_season = await validate_with_season_fallback(
+            adapter, league_id, season_candidates
+        )
 
         # If token was refreshed, persist the new tokens
         if hasattr(adapter, '_token_refreshed') and adapter._token_refreshed:
@@ -105,13 +130,15 @@ async def validate_league(
             league_name=settings.get("league_name"),
             playoff_spots=settings.get("playoff_spots"),
             num_divisions=settings.get("num_divisions"),
-            sport=sport.lower()
+            sport=sport.lower(),
+            season=resolved_season
         )
 
     except LeagueNotFoundError:
+        seasons_tried = ", ".join(str(s) for s in season_candidates)
         return LeagueValidateResponse(
             valid=False,
-            error=f"League {league_id} not found for season {season}"
+            error=f"League {league_id} not found for season{'s' if len(season_candidates) > 1 else ''} {seasons_tried}"
         )
     except LeaguePrivateError:
         return LeagueValidateResponse(

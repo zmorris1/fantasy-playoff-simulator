@@ -4,13 +4,26 @@ Monte Carlo simulation engine for playoff probability calculations.
 
 import random
 from collections import defaultdict
-from typing import Dict, List, Tuple, Optional
+from typing import Callable, Dict, List, Tuple, Optional
 
 from .models import Team, Matchup, H2HDict, SimulationResult
-from .tiebreakers import resolve_tiebreaker
+from .tiebreakers import CoinFlipper, H2HTable, resolve_tiebreaker
 
 
 PLAYOFF_SPOTS = 6
+
+
+def _record_h2h(sim_h2h: Dict[Tuple[int, int], List[int]], team1_id: int, team2_id: int,
+                team1_wins: int, team2_wins: int) -> None:
+    """Add a result to a mutable H2H dict keyed (min_id, max_id)."""
+    if team1_id < team2_id:
+        entry = sim_h2h[(team1_id, team2_id)]
+        entry[0] += team1_wins
+        entry[1] += team2_wins
+    else:
+        entry = sim_h2h[(team2_id, team1_id)]
+        entry[0] += team2_wins
+        entry[1] += team1_wins
 
 
 def apply_outcome(
@@ -45,11 +58,7 @@ def apply_outcome(
             sim_teams[winner_id].division_wins += 1
             sim_teams[loser_id].division_losses += 1
 
-        key = (min(winner_id, loser_id), max(winner_id, loser_id))
-        if winner_id < loser_id:
-            sim_h2h[key][0] += 1
-        else:
-            sim_h2h[key][1] += 1
+        _record_h2h(sim_h2h, winner_id, loser_id, 1, 0)
 
     # Convert lists to tuples
     return sim_teams, {k: tuple(v) for k, v in sim_h2h.items()}
@@ -61,7 +70,8 @@ def determine_playoffs(
     sim_h2h: H2HDict,
     playoff_spots: int = PLAYOFF_SPOTS,
     disfavor_id: Optional[int] = None,
-    favor_id: Optional[int] = None
+    favor_id: Optional[int] = None,
+    flipper: Optional[CoinFlipper] = None
 ) -> Tuple[List[int], List[int]]:
     """
     Determine playoff teams based on standings and tiebreakers.
@@ -73,10 +83,21 @@ def determine_playoffs(
         playoff_spots: Number of playoff spots
         disfavor_id: Team that always loses coin flips (worst case for clinch)
         favor_id: Team that always wins coin flips (best case for elimination)
+        flipper: Orders teams still tied after every tiebreaker (default: random)
 
     Returns:
         Tuple of (playoff team IDs in seeding order, division winner IDs)
     """
+    table = H2HTable(h2h, sim_h2h)
+    pct = {tid: t.win_pct for tid, t in teams.items()}
+
+    def resolve(group: List[Team]) -> List[Team]:
+        return resolve_tiebreaker(
+            group, h2h, sim_h2h,
+            disfavor_id=disfavor_id, favor_id=favor_id,
+            flipper=flipper, table=table
+        )
+
     # Group teams by division
     divisions = defaultdict(list)
     for team in teams.values():
@@ -84,27 +105,22 @@ def determine_playoffs(
 
     # Find division winners
     division_winners = []
-    for div_id, div_teams in sorted(divisions.items()):
-        # Sort by win percentage
-        sorted_div = sorted(div_teams, key=lambda t: t.win_pct, reverse=True)
-
-        # Find teams tied for best record
-        best_pct = sorted_div[0].win_pct
-        tied_for_first = [t for t in sorted_div if t.win_pct == best_pct]
+    for div_id in sorted(divisions, key=str):
+        div_teams = divisions[div_id]
+        best_pct = max(pct[t.id] for t in div_teams)
+        tied_for_first = [t for t in div_teams if pct[t.id] == best_pct]
 
         if len(tied_for_first) > 1:
-            tied_for_first = resolve_tiebreaker(
-                tied_for_first, h2h, sim_h2h,
-                disfavor_id=disfavor_id, favor_id=favor_id
-            )
+            tied_for_first = resolve(tied_for_first)
 
         division_winners.append(tied_for_first[0].id)
 
     # Get remaining teams for wild card spots
-    remaining_teams = [t for t in teams.values() if t.id not in division_winners]
+    winner_set = set(division_winners)
+    remaining_teams = [t for t in teams.values() if t.id not in winner_set]
 
     # Sort remaining teams by win percentage
-    remaining_sorted = sorted(remaining_teams, key=lambda t: t.win_pct, reverse=True)
+    remaining_sorted = sorted(remaining_teams, key=lambda t: pct[t.id], reverse=True)
 
     # Fill remaining playoff spots with tiebreaker resolution
     wild_card = []
@@ -113,14 +129,12 @@ def determine_playoffs(
 
     while len(wild_card) < spots_needed and i < len(remaining_sorted):
         # Find all teams tied at this record
-        current_pct = remaining_sorted[i].win_pct
-        tied_group = [t for t in remaining_sorted[i:] if t.win_pct == current_pct]
+        current_pct = pct[remaining_sorted[i].id]
+        tied_group = [t for t in remaining_sorted[i:] if pct[t.id] == current_pct]
 
-        if len(tied_group) > 1:
-            tied_group = resolve_tiebreaker(
-                tied_group, h2h, sim_h2h,
-                disfavor_id=disfavor_id, favor_id=favor_id
-            )
+        # Only break the tie if it straddles the playoff line
+        if len(tied_group) > 1 and len(wild_card) + len(tied_group) > spots_needed:
+            tied_group = resolve(tied_group)
 
         # Add teams from this group up to spots needed
         for team in tied_group:
@@ -135,24 +149,17 @@ def determine_playoffs(
     all_playoff_ids = division_winners + wild_card
 
     # Sort all playoff teams by record to determine seeding (#1 seed = best record)
-    playoff_teams_sorted = sorted(
-        all_playoff_ids,
-        key=lambda tid: teams[tid].win_pct,
-        reverse=True
-    )
+    playoff_teams_sorted = sorted(all_playoff_ids, key=pct.__getitem__, reverse=True)
 
     # Handle ties for #1 seed using tiebreaker
     if len(playoff_teams_sorted) >= 2:
-        best_pct = teams[playoff_teams_sorted[0]].win_pct
-        tied_for_first = [teams[tid] for tid in playoff_teams_sorted if teams[tid].win_pct == best_pct]
+        best_pct = pct[playoff_teams_sorted[0]]
+        tied_for_first = [teams[tid] for tid in playoff_teams_sorted if pct[tid] == best_pct]
         if len(tied_for_first) > 1:
-            tied_for_first = resolve_tiebreaker(
-                tied_for_first, h2h, sim_h2h,
-                disfavor_id=disfavor_id, favor_id=favor_id
-            )
+            tied_for_first = resolve(tied_for_first)
             # Rebuild the list with tiebreaker order for tied teams
             tied_ids = [t.id for t in tied_for_first]
-            other_ids = [tid for tid in playoff_teams_sorted if teams[tid].win_pct != best_pct]
+            other_ids = [tid for tid in playoff_teams_sorted if pct[tid] != best_pct]
             playoff_teams_sorted = tied_ids + other_ids
 
     return playoff_teams_sorted, division_winners
@@ -164,7 +171,8 @@ def simulate_season(
     h2h: H2HDict,
     n_simulations: int = 10000,
     playoff_spots: int = PLAYOFF_SPOTS,
-    progress_callback: Optional[callable] = None
+    progress_callback: Optional[Callable[[float], None]] = None,
+    categories_per_matchup: int = 1
 ) -> Dict[int, SimulationResult]:
     """
     Run Monte Carlo simulation of the remaining season.
@@ -176,6 +184,10 @@ def simulate_season(
         n_simulations: Number of simulations to run
         playoff_spots: Number of playoff spots
         progress_callback: Optional callback for progress updates (receives percent complete)
+        categories_per_matchup: 1 for leagues where each matchup is a single
+            win/loss (points, most-categories). For "each category" leagues,
+            the number of categories: every matchup then splits that many
+            wins between the two teams, each category a 50/50 coin flip.
 
     Returns:
         Dict mapping team_id -> SimulationResult
@@ -185,9 +197,14 @@ def simulate_season(
         for team_id in teams
     }
 
+    n_cats = max(1, int(categories_per_matchup))
+    getrandbits = random.getrandbits
+    games = [(m.home_team_id, m.away_team_id, m.is_division_game) for m in remaining]
+    report_every = max(1, n_simulations // 100)
+
     for sim_idx in range(n_simulations):
         # Report progress periodically
-        if progress_callback and sim_idx % 100 == 0:
+        if progress_callback and sim_idx % report_every == 0:
             progress_callback(sim_idx / n_simulations * 100)
 
         # Copy current standings
@@ -196,27 +213,31 @@ def simulate_season(
         # Track simulated H2H results
         sim_h2h: Dict[Tuple[int, int], List[int]] = defaultdict(lambda: [0, 0, 0])
 
-        # Simulate remaining matchups (50/50 random)
-        for matchup in remaining:
-            winner_id = random.choice([matchup.home_team_id, matchup.away_team_id])
-            loser_id = (matchup.away_team_id if winner_id == matchup.home_team_id
-                       else matchup.home_team_id)
+        for home_id, away_id, is_div in games:
+            home = sim_teams[home_id]
+            away = sim_teams[away_id]
 
-            # Update records
-            sim_teams[winner_id].wins += 1
-            sim_teams[loser_id].losses += 1
-
-            # Update division records if applicable
-            if matchup.is_division_game:
-                sim_teams[winner_id].division_wins += 1
-                sim_teams[loser_id].division_losses += 1
-
-            # Track simulated H2H
-            key = (min(winner_id, loser_id), max(winner_id, loser_id))
-            if winner_id < loser_id:
-                sim_h2h[key][0] += 1
+            if n_cats == 1:
+                # Single result per matchup, 50/50
+                home_wins = getrandbits(1)
+                away_wins = 1 - home_wins
             else:
-                sim_h2h[key][1] += 1
+                # Each category is an independent 50/50 coin flip
+                home_wins = getrandbits(n_cats).bit_count()
+                away_wins = n_cats - home_wins
+
+            home.wins += home_wins
+            home.losses += away_wins
+            away.wins += away_wins
+            away.losses += home_wins
+
+            if is_div:
+                home.division_wins += home_wins
+                home.division_losses += away_wins
+                away.division_wins += away_wins
+                away.division_losses += home_wins
+
+            _record_h2h(sim_h2h, home_id, away_id, home_wins, away_wins)
 
         # Convert lists to tuples for sim_h2h
         sim_h2h_tuples = {k: tuple(v) for k, v in sim_h2h.items()}
@@ -239,19 +260,14 @@ def simulate_season(
             results[playoff_teams[0]].first_seed += 1
 
         # Record last place - find teams with worst record, use tiebreaker for ties
-        all_teams = list(sim_teams.values())
-        worst_pct = min(t.win_pct for t in all_teams)
-        tied_for_last = [t for t in all_teams if t.win_pct == worst_pct]
+        worst_pct = min(t.win_pct for t in sim_teams.values())
+        tied_for_last = [t for t in sim_teams.values() if t.win_pct == worst_pct]
 
         if len(tied_for_last) > 1:
-            # Use tiebreaker in reverse (worst team first) - no favor/disfavor for fair randomization
-            tied_for_last = resolve_tiebreaker(tied_for_last, h2h, sim_h2h_tuples)
             # Last place is the LAST in the resolved order (worst of the worst)
-            last_place_team = tied_for_last[-1]
-        else:
-            last_place_team = tied_for_last[0]
+            tied_for_last = resolve_tiebreaker(tied_for_last, h2h, sim_h2h_tuples)
 
-        results[last_place_team.id].last_place += 1
+        results[tied_for_last[-1].id].last_place += 1
 
     # Final progress update
     if progress_callback:

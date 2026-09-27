@@ -7,8 +7,14 @@ Monte Carlo simulation to calculate playoff probabilities.
 from .models import Team, Matchup, LeagueSettings, SimulationResult, MagicNumbers, H2HDict
 from .engine import simulate_season, determine_playoffs, apply_outcome
 from .tiebreakers import resolve_tiebreaker, get_h2h_record
-from .magic_numbers import calculate_magic_numbers
-from .scenarios import generate_clinch_elimination_scenarios, brute_force_clinch_elimination
+from .magic_numbers import calculate_magic_numbers, LeagueMath
+from .scenarios import (
+    generate_clinch_elimination_scenarios,
+    brute_force_clinch_elimination,
+    scenario_week,
+    ScenarioReport,
+    BRUTE_FORCE_MAX_GAMES,
+)
 
 __all__ = [
     # Models
@@ -27,7 +33,11 @@ __all__ = [
     "get_h2h_record",
     # Magic numbers
     "calculate_magic_numbers",
+    "LeagueMath",
     # Scenarios
     "generate_clinch_elimination_scenarios",
     "brute_force_clinch_elimination",
+    "scenario_week",
+    "ScenarioReport",
+    "BRUTE_FORCE_MAX_GAMES",
 ]

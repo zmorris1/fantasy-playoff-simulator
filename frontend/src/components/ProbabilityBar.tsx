@@ -9,8 +9,10 @@ export default function ProbabilityBar({
   colorClass = 'bg-primary-500',
   showLabel = true,
 }: ProbabilityBarProps) {
-  const percentage = Math.round(value * 1000) / 10;
-  const displayValue = percentage.toFixed(1);
+  // Undecided odds never round to a flat 0% or 100%
+  let displayValue = (Math.round(value * 1000) / 10).toFixed(1) + '%';
+  if (value > 0 && value < 0.001) displayValue = '<0.1%';
+  if (value < 1 && value > 0.999) displayValue = '>99.9%';
 
   // Determine color based on value
   let barColor = colorClass;
@@ -35,7 +37,7 @@ export default function ProbabilityBar({
       </div>
       {showLabel && (
         <span className="text-sm font-medium text-gray-700 w-14 text-right">
-          {displayValue}%
+          {displayValue}
         </span>
       )}
     </div>

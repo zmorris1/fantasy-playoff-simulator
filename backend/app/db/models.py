@@ -13,6 +13,11 @@ class Base(DeclarativeBase):
     pass
 
 
+def as_utc(value: datetime) -> datetime:
+    """SQLite returns naive datetimes even for timezone-aware columns; treat them as UTC."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
 class User(Base):
     """User account model."""
 
@@ -102,7 +107,7 @@ class SimulationCache(Base):
     @property
     def is_expired(self) -> bool:
         """Check if the cache entry has expired."""
-        return datetime.now(timezone.utc) > self.expires_at
+        return datetime.now(timezone.utc) > as_utc(self.expires_at)
 
 
 class YahooCredential(Base):
@@ -136,7 +141,7 @@ class YahooCredential(Base):
     @property
     def is_expired(self) -> bool:
         """Check if the access token has expired."""
-        return datetime.now(timezone.utc) > self.expires_at
+        return datetime.now(timezone.utc) > as_utc(self.expires_at)
 
 
 class CBSCredential(Base):
@@ -170,7 +175,7 @@ class CBSCredential(Base):
     @property
     def is_expired(self) -> bool:
         """Check if the access token has expired."""
-        return datetime.now(timezone.utc) > self.expires_at
+        return datetime.now(timezone.utc) > as_utc(self.expires_at)
 
 
 class SimulationTask(Base):

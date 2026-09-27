@@ -12,12 +12,12 @@ export default function ScenarioCard({ title, scenarios, type }: ScenarioCardPro
   const borderColor = type === 'clinch' ? 'border-green-200' : 'border-red-200';
   const bgColor = type === 'clinch' ? 'bg-green-50' : 'bg-red-50';
   const iconColor = type === 'clinch' ? 'text-green-600' : 'text-red-600';
-  const icon = type === 'clinch' ? '&#10003;' : '&#10006;';
+  const icon = type === 'clinch' ? '✓' : '✖';
 
   return (
     <div className={`card ${bgColor} border ${borderColor}`}>
       <h3 className="font-bold text-lg text-gray-900 mb-4 flex items-center gap-2">
-        <span className={`${iconColor}`} dangerouslySetInnerHTML={{ __html: icon }} />
+        <span className={iconColor}>{icon}</span>
         {title}
       </h3>
       <ul className="space-y-2">
@@ -31,27 +31,24 @@ export default function ScenarioCard({ title, scenarios, type }: ScenarioCardPro
   );
 }
 
-function formatScenario(scenario: string): React.ReactNode {
-  // Bold team names and highlight key words
-  const parts = scenario.split(/(WIN|LOSS|AND|OR|clinches|eliminated)/gi);
+const HIGHLIGHTS: Record<string, string> = {
+  WIN: 'text-green-600 font-bold',
+  LOSS: 'text-red-600 font-bold',
+  clinches: 'text-green-700 font-semibold',
+  eliminated: 'text-red-700 font-semibold',
+};
 
-  return parts.map((part, idx) => {
-    const upper = part.toUpperCase();
-    if (upper === 'WIN') {
-      return <span key={idx} className="text-green-600 font-bold">{part}</span>;
-    }
-    if (upper === 'LOSS') {
-      return <span key={idx} className="text-red-600 font-bold">{part}</span>;
-    }
-    if (upper === 'AND' || upper === 'OR') {
-      return <span key={idx} className="text-gray-500 font-medium"> {part} </span>;
-    }
-    if (upper === 'CLINCHES') {
-      return <span key={idx} className="text-green-700 font-semibold">{part}</span>;
-    }
-    if (upper === 'ELIMINATED') {
-      return <span key={idx} className="text-red-700 font-semibold">{part}</span>;
-    }
-    return part;
-  });
+function formatScenario(scenario: string): React.ReactNode {
+  // Highlight key words. Whole words and exact case only, so team names
+  // like "Warriors" or "Win-Now Crew" are left alone.
+  const parts = scenario.split(/\b(WIN|LOSS|clinches|eliminated)\b/);
+
+  return parts.map((part, idx) =>
+    // Odd indexes are the captured key words
+    idx % 2 === 1 ? (
+      <span key={idx} className={HIGHLIGHTS[part]}>{part}</span>
+    ) : (
+      part
+    )
+  );
 }

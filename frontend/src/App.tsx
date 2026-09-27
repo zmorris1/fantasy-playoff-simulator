@@ -7,6 +7,7 @@ import Login from './pages/Login';
 import Register from './pages/Register';
 import Dashboard from './pages/Dashboard';
 import Navbar from './components/Navbar';
+import BackendStatusBanner from './components/BackendStatusBanner';
 
 function App() {
   const [user, setUser] = useState<User | null>(null);
@@ -44,6 +45,7 @@ function App() {
 
   return (
     <div className="min-h-screen bg-gray-50">
+      <BackendStatusBanner />
       <Navbar user={user} onLogout={handleLogout} />
       <main className="container mx-auto px-4 py-8">
         <Routes>

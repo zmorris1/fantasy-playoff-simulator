@@ -32,9 +32,9 @@ export default function ProgressIndicator({ progress, status }: ProgressIndicato
       </div>
 
       <p className="text-sm text-gray-500">
-        {progress < 40 && 'Fetching league data from ESPN...'}
-        {progress >= 40 && progress < 50 && 'Calculating magic numbers...'}
-        {progress >= 50 && progress < 95 && 'Running simulations (10,000 scenarios)...'}
+        {progress < 40 && 'Fetching league data...'}
+        {progress >= 40 && progress < 50 && 'Calculating magic numbers and clinch scenarios...'}
+        {progress >= 50 && progress < 95 && 'Simulating the rest of the season...'}
         {progress >= 95 && progress < 100 && 'Finalizing results...'}
       </p>
     </div>

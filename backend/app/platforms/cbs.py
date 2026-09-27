@@ -18,6 +18,7 @@ from .base import (
     PlatformError
 )
 from ..simulator.models import Team, Matchup, H2HDict
+from ..core.http import async_client
 from ..core.sports import Sport, CBS_SPORT_CODES
 from ..core.cbs_oauth import refresh_access_token, CBSOAuthError, CBSTokenExpiredError
 from ..db.models import CBSCredential
@@ -72,7 +73,11 @@ class CBSAdapter(PlatformAdapter):
 
         # Check if token is expired or will expire soon (within 5 minutes)
         now = datetime.now(timezone.utc)
-        if self.credential.is_expired or (self.credential.expires_at - now).total_seconds() < 300:
+        expires_at = self.credential.expires_at
+        if expires_at.tzinfo is None:
+            # SQLite drops the timezone; stored values are UTC
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if self.credential.is_expired or (expires_at - now).total_seconds() < 300:
             if self._token_refreshed:
                 # Already tried to refresh, something is wrong
                 raise CBSTokenExpiredError("Token refresh failed. Please reconnect your CBS account.")
@@ -113,7 +118,7 @@ class CBSAdapter(PlatformAdapter):
             params = {}
         params["response_format"] = "json"
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with async_client(self.timeout) as client:
             try:
                 response = await client.get(
                     url,

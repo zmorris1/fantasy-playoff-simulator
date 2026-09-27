@@ -5,360 +5,324 @@ Generates narrative scenarios for the current week describing how teams can
 clinch playoffs/division or be eliminated.
 """
 
-import itertools
-from collections import defaultdict
-from typing import Dict, List, Tuple, Any, Optional
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional
 
-from .models import Team, Matchup, MagicNumbers, H2HDict
+from .models import Team, Matchup, H2HDict
 from .engine import determine_playoffs, apply_outcome
+from .tiebreakers import CoinFlipper, all_coin_flip_outcomes
+from .magic_numbers import LeagueMath
 
 
 PLAYOFF_SPOTS = 6
+
+# Exhaustive enumeration covers every outcome of every remaining game (2^n),
+# so it is only used near the end of the season
+BRUTE_FORCE_MAX_GAMES = 10
+
+# Cap on coin-flip orderings examined per team and outcome (6! = a 6-way
+# coin flip; real leagues essentially never get near it)
+COIN_FLIP_ORDERINGS_LIMIT = 720
+
+GOAL_LABELS = {
+    "playoffs": "playoff spot",
+    "division": "division",
+    "first_seed": "#1 seed",
+}
+
+ELIMINATION_LABELS = {
+    "playoffs": "eliminated from playoffs",
+    "division": "eliminated from division race",
+}
+
+
+@dataclass
+class ScenarioReport:
+    """Narrative scenarios for this week, plus exact status when known."""
+
+    clinch: List[str]
+    elimination: List[str]
+    # team_id -> {"clinched_playoffs": bool, ...}. Only set by exhaustive
+    # enumeration, where clinched/eliminated are known exactly.
+    statuses: Optional[Dict[int, Dict[str, bool]]] = None
+
+
+def scenario_week(remaining: List[Matchup], current_week: int) -> int:
+    """The week scenarios describe: the current week, or the next week with games."""
+    weeks = {m.week for m in remaining}
+    if current_week in weeks or not weeks:
+        return current_week
+    return min(weeks)
+
+
+def _opponents(remaining: List[Matchup], week: int) -> Dict[int, int]:
+    opponents = {}
+    for m in remaining:
+        if m.week == week:
+            opponents[m.home_team_id] = m.away_team_id
+            opponents[m.away_team_id] = m.home_team_id
+    return opponents
+
+
+def _dedupe(items: List[str]) -> List[str]:
+    return list(dict.fromkeys(items))
 
 
 def generate_clinch_elimination_scenarios(
     teams: Dict[int, Team],
     remaining: List[Matchup],
-    magic_numbers: Dict[int, MagicNumbers],
-    division_names: Dict[int, str],
+    h2h: H2HDict,
     current_week: int,
-    playoff_spots: int = PLAYOFF_SPOTS
-) -> Tuple[List[str], List[str]]:
+    playoff_spots: int = PLAYOFF_SPOTS,
+    categories_per_matchup: int = 1
+) -> ScenarioReport:
     """
     Generate narrative clinch and elimination scenarios for the current week.
 
     This is the analytical approach used when there are too many remaining games
-    for brute-force enumeration.
+    for brute-force enumeration. A scenario is only reported when it holds no
+    matter how every other game (this week and later) turns out.
 
     Args:
         teams: Current team standings
         remaining: List of remaining matchups
-        magic_numbers: Pre-calculated magic numbers
-        division_names: Division ID to name mapping
+        h2h: Historical head-to-head records
         current_week: Current week number
         playoff_spots: Number of playoff spots
+        categories_per_matchup: Units per matchup (see simulate_season)
 
     Returns:
-        Tuple of (clinch_scenarios, elimination_scenarios) as lists of strings
+        ScenarioReport with clinch and elimination scenario strings
     """
-    # Get current week's matchups only
-    current_week_matchups = [m for m in remaining if m.week == current_week]
-
-    # Build lookup: team_id -> opponent_id for this week
-    opponents = {}
-    for m in current_week_matchups:
-        opponents[m.home_team_id] = m.away_team_id
-        opponents[m.away_team_id] = m.home_team_id
-
-    # Helper to get effective wins
-    def effective_wins(team: Team) -> float:
-        return team.wins + 0.5 * team.ties
-
-    # Count remaining games per team
-    games_remaining = defaultdict(int)
-    for m in remaining:
-        games_remaining[m.home_team_id] += 1
-        games_remaining[m.away_team_id] += 1
-
-    # Group teams by division
-    divisions = defaultdict(list)
-    for team in teams.values():
-        divisions[team.division_id].append(team)
+    league = LeagueMath(teams, remaining, h2h, playoff_spots, categories_per_matchup)
+    units = league.units
+    opponents = _opponents(remaining, scenario_week(remaining, current_week))
 
     clinch_scenarios = []
     elimination_scenarios = []
 
     for team in teams.values():
-        team_magic = magic_numbers[team.id]
         opponent_id = opponents.get(team.id)
-        opponent = teams.get(opponent_id) if opponent_id else None
+        if opponent_id is None:
+            continue
+        opponent = teams[opponent_id]
+        eff = league.eff(team)
+        later_gain = league.max_gain(team.id) - units
 
         # === CLINCH SCENARIOS ===
+        for goal, label in GOAL_LABELS.items():
+            if league.magic_number(team, goal) == 0:
+                continue  # Already clinched
 
-        # Can clinch division with a win (magic number 1)
-        if team_magic.magic_division == 1 and opponent:
-            clinch_scenarios.append(
-                f"{team.name} clinches division with a WIN vs {opponent.name}"
-            )
-
-        # Can clinch playoffs with a win (magic number 1)
-        if team_magic.magic_playoffs == 1 and opponent:
-            clinch_scenarios.append(
-                f"{team.name} clinches playoff spot with a WIN vs {opponent.name}"
-            )
-
-        # Can clinch #1 seed with a win
-        if team_magic.magic_first_seed == 1 and opponent:
-            clinch_scenarios.append(
-                f"{team.name} clinches #1 seed with a WIN vs {opponent.name}"
-            )
+            # Fewest units won this week that clinch, even if the team loses
+            # everything afterwards
+            for won in range(1, units + 1):
+                ahead = league.can_finish_ahead(team, eff + won, {opponent_id: won})
+                if league.clinched_given(team, ahead, goal):
+                    if units == 1:
+                        text = f"{team.name} clinches {label} with a WIN vs {opponent.name}"
+                    else:
+                        text = (f"{team.name} clinches {label} by winning {won}+ of "
+                                f"{units} categories vs {opponent.name}")
+                    clinch_scenarios.append(text)
+                    break
 
         # === ELIMINATION SCENARIOS ===
+        for goal, label in ELIMINATION_LABELS.items():
+            if league.eliminated(team, goal):
+                continue  # Already eliminated
 
-        # Check if team can be eliminated from playoff contention this week
-        team_max_potential = effective_wins(team) + games_remaining[team.id]
+            # Most units won this week that still eliminate the team, even if
+            # it wins everything afterwards
+            for won in range(units - 1, -1, -1):
+                best = eff + won + later_gain
+                ahead = league.certainly_ahead(team, best, {opponent_id: units - won})
+                if league.eliminated_given(team, ahead, goal):
+                    if units == 1:
+                        text = f"{team.name} {label} if: LOSS to {opponent.name}"
+                    else:
+                        text = (f"{team.name} {label} if: they win {won} or fewer of "
+                                f"{units} categories vs {opponent.name}")
+                    elimination_scenarios.append(text)
+                    break
 
-        if opponent:
-            team_max_if_loses = team_max_potential - 1
+    return ScenarioReport(_dedupe(clinch_scenarios), _dedupe(elimination_scenarios))
 
-            # Count how many teams would have higher guaranteed minimums
-            scenario_mins = []
-            for other in teams.values():
-                if other.id == team.id:
-                    continue
-                if other.id == opponent_id:
-                    # Opponent wins, gets +1
-                    min_wins = effective_wins(other) + 1
-                else:
-                    min_wins = effective_wins(other)
-                scenario_mins.append((other.id, min_wins))
 
-            scenario_mins.sort(key=lambda x: x[1], reverse=True)
-
-            # Calculate current standings to check if already eliminated
-            current_eff_wins = [(t.id, effective_wins(t)) for t in teams.values() if t.id != team.id]
-            current_eff_wins.sort(key=lambda x: x[1], reverse=True)
-            sixth_best_current = current_eff_wins[playoff_spots - 1][1] if len(current_eff_wins) >= playoff_spots else 0
-
-            not_already_eliminated = team_max_potential >= sixth_best_current
-
-            if len(scenario_mins) >= playoff_spots:
-                sixth_best_min = scenario_mins[playoff_spots - 1][1]
-                if sixth_best_min > team_max_if_loses and not_already_eliminated:
-                    elimination_scenarios.append(
-                        f"{team.name} eliminated from playoffs if: LOSS to {opponent.name}"
-                    )
-
-    # Remove duplicates
-    seen_clinch = set()
-    unique_clinch = []
-    for s in clinch_scenarios:
-        if s not in seen_clinch:
-            seen_clinch.add(s)
-            unique_clinch.append(s)
-
-    seen_elim = set()
-    unique_elim = []
-    for s in elimination_scenarios:
-        if s not in seen_elim:
-            seen_elim.add(s)
-            unique_elim.append(s)
-
-    return unique_clinch, unique_elim
+def _achieved(team_id: int, playoff_teams: List[int], division_winners: List[int]) -> Dict[str, bool]:
+    return {
+        "playoffs": team_id in playoff_teams,
+        "division": team_id in division_winners,
+        "first_seed": bool(playoff_teams) and playoff_teams[0] == team_id,
+    }
 
 
 def brute_force_clinch_elimination(
     teams: Dict[int, Team],
     remaining: List[Matchup],
     h2h: H2HDict,
-    division_names: Dict[int, str],
     current_week: int,
     playoff_spots: int = PLAYOFF_SPOTS,
-    progress_callback: Optional[callable] = None
-) -> Tuple[List[str], List[str]]:
+    progress_callback: Optional[Callable[[float], None]] = None
+) -> ScenarioReport:
     """
-    Enumerate all possible outcomes for remaining games and use determine_playoffs()
-    directly to verify clinch/elimination scenarios. Only used when remaining games <= 10.
+    Enumerate every outcome of every remaining game and use determine_playoffs()
+    directly to find exact clinch/elimination scenarios. Only used when there
+    are at most BRUTE_FORCE_MAX_GAMES remaining games.
 
-    For each team:
-    - Clinch: call determine_playoffs with disfavor_id (team loses all coin flips).
-      If team makes playoffs in ALL outcomes, it has clinched.
-    - Elimination: call determine_playoffs with favor_id (team wins all coin flips).
-      If team misses playoffs in ALL outcomes, it is eliminated.
+    For each team and goal (playoffs, division, #1 seed):
+    - Clinched: achieved in ALL outcomes with the team losing every coin flip.
+    - Eliminated: missed in ALL outcomes with the team winning every coin flip.
+    - "Clinches with a WIN": achieved in all outcomes where the team wins this
+      week's game. "Eliminated if LOSS": missed in all outcomes where it loses.
 
-    Multiple runs per outcome (25) handle randomness in OTHER teams' coin flips.
+    When a coin flip decided something, every possible ordering of the other
+    teams' coin flips is checked as well.
 
     Args:
         teams: Current team standings
         remaining: List of remaining matchups
         h2h: Historical head-to-head records
-        division_names: Division ID to name mapping
         current_week: Current week number
         playoff_spots: Number of playoff spots
         progress_callback: Optional callback for progress updates
 
     Returns:
-        Tuple of (clinch_scenarios, elimination_scenarios) as lists of strings
+        ScenarioReport with scenario strings and exact per-team statuses
     """
-    # Get current week matchups
-    current_week_matchups = [m for m in remaining if m.week == current_week]
-
-    if len(current_week_matchups) == 0:
-        return [], []
-
-    # Build lookup: team_id -> opponent_id for this week
-    opponents = {}
-    for m in current_week_matchups:
-        opponents[m.home_team_id] = m.away_team_id
-        opponents[m.away_team_id] = m.home_team_id
-
-    # For each game, the two possible winners
-    n_games = len(current_week_matchups)
-    game_options = [(m.home_team_id, m.away_team_id) for m in current_week_matchups]
-
-    total_outcomes = 2 ** n_games
-    coin_flip_runs = 25
-
+    week = scenario_week(remaining, current_week)
+    opponents = _opponents(remaining, week)
     team_ids = list(teams.keys())
 
-    # Track results
-    clinch_all = {tid: True for tid in team_ids}
-    elim_all = {tid: True for tid in team_ids}
-    team_clinch_when_wins = {tid: True for tid in team_ids}
-    team_elim_when_loses = {tid: True for tid in team_ids}
-    div_clinch_all = {tid: True for tid in team_ids}
-    div_elim_all = {tid: True for tid in team_ids}
-    team_div_clinch_when_wins = {tid: True for tid in team_ids}
-    team_div_elim_when_loses = {tid: True for tid in team_ids}
+    # Index of each team's game this week within `remaining`
+    this_week_game = {}
+    for idx, m in enumerate(remaining):
+        if m.week == week:
+            this_week_game[m.home_team_id] = idx
+            this_week_game[m.away_team_id] = idx
 
-    # Map team_id -> game index
-    team_game_idx = {}
-    for idx, m in enumerate(current_week_matchups):
-        team_game_idx[m.home_team_id] = idx
-        team_game_idx[m.away_team_id] = idx
+    game_options = [(m.home_team_id, m.away_team_id) for m in remaining]
+    n_games = len(remaining)
+    total_outcomes = 1 << n_games
+    report_every = max(1, total_outcomes // 100)
 
-    outcome_playoff_results = {}
+    goals = tuple(GOAL_LABELS)
+    always = {g: dict.fromkeys(team_ids, True) for g in goals}
+    never = {g: dict.fromkeys(team_ids, True) for g in goals}
+    # "With a WIN" / "if LOSS" only apply to teams that play this week
+    has_game = {tid: tid in this_week_game for tid in team_ids}
+    always_if_win = {g: dict(has_game) for g in goals}
+    never_if_loss = {g: dict(has_game) for g in goals}
+
+    def pinned_result(sim_teams, sim_h2h, tid: int, favor: bool, wanted: List[str]) -> Dict[str, bool]:
+        """
+        Goals achieved with `tid` losing (favor=False) or winning (favor=True)
+        every coin flip, over every possible ordering of other teams' coin
+        flips. Worst case needs a goal under every ordering; best case under any.
+        """
+        def run(flipper):
+            p, d = determine_playoffs(
+                sim_teams, h2h, sim_h2h,
+                playoff_spots=playoff_spots,
+                favor_id=tid if favor else None,
+                disfavor_id=None if favor else tid,
+                flipper=flipper
+            )
+            return _achieved(tid, p, d)
+
+        result = {g: not favor for g in wanted}
+        for achieved in all_coin_flip_outcomes(run, limit=COIN_FLIP_ORDERINGS_LIMIT):
+            for g in wanted:
+                result[g] = (result[g] or achieved[g]) if favor else (result[g] and achieved[g])
+            # Stop once more orderings can't change anything
+            if all(result[g] == favor for g in wanted):
+                break
+        return result
+
+    def anything_open() -> bool:
+        return any(
+            always[g][tid] or never[g][tid] or always_if_win[g][tid] or never_if_loss[g][tid]
+            for g in goals for tid in team_ids
+        )
 
     for outcome_idx in range(total_outcomes):
-        if progress_callback and outcome_idx % 10 == 0:
+        if progress_callback and outcome_idx % report_every == 0:
             progress_callback(outcome_idx / total_outcomes * 100)
 
-        # Convert outcome index to list of winners
-        winners = []
-        for game_idx in range(n_games):
-            bit = (outcome_idx >> game_idx) & 1
-            winners.append(game_options[game_idx][bit])
+        winners = [game_options[i][(outcome_idx >> i) & 1] for i in range(n_games)]
 
-        outcome_key = tuple(winners)
-
-        # Apply this week's outcomes
-        sim_teams, sim_h2h = apply_outcome(teams, current_week_matchups, winners, h2h)
-
-        outcome_results = {}
-
+        # Only evaluate teams whose answers this outcome could still change.
+        # Every flag only ever flips from True to False, so once a team is
+        # neither clinched, eliminated, nor has a win/loss scenario, it's settled.
+        pending = {}
         for tid in team_ids:
-            # Clinch check: disfavor this team (worst case)
-            made_playoffs_all_runs = True
-            won_division_all_runs = True
-            for _ in range(coin_flip_runs):
-                playoff_teams, division_winners = determine_playoffs(
-                    sim_teams, h2h, sim_h2h,
-                    playoff_spots=playoff_spots,
-                    disfavor_id=tid
-                )
-                if tid not in playoff_teams:
-                    made_playoffs_all_runs = False
-                if tid not in division_winners:
-                    won_division_all_runs = False
-                if not made_playoffs_all_runs and not won_division_all_runs:
-                    break
+            game_idx = this_week_game.get(tid)
+            won = game_idx is not None and winners[game_idx] == tid
+            lost = game_idx is not None and not won
+            worst_goals = [g for g in goals if always[g][tid] or (won and always_if_win[g][tid])]
+            best_goals = [g for g in goals if never[g][tid] or (lost and never_if_loss[g][tid])]
+            if worst_goals or best_goals:
+                pending[tid] = (won, lost, worst_goals, best_goals)
 
-            if not made_playoffs_all_runs:
-                clinch_all[tid] = False
-                game_idx = team_game_idx.get(tid)
-                if game_idx is not None and winners[game_idx] == tid:
-                    team_clinch_when_wins[tid] = False
+        if not pending:
+            if not anything_open():
+                break  # Every answer is final
+            continue
 
-            if not won_division_all_runs:
-                div_clinch_all[tid] = False
-                game_idx = team_game_idx.get(tid)
-                if game_idx is not None and winners[game_idx] == tid:
-                    team_div_clinch_when_wins[tid] = False
+        sim_teams, sim_h2h = apply_outcome(teams, remaining, winners, h2h)
 
-            # Elimination check: favor this team (best case)
-            missed_playoffs_all_runs = True
-            missed_division_all_runs = True
-            for _ in range(coin_flip_runs):
-                playoff_teams, division_winners = determine_playoffs(
-                    sim_teams, h2h, sim_h2h,
-                    playoff_spots=playoff_spots,
-                    favor_id=tid
-                )
-                if tid in playoff_teams:
-                    missed_playoffs_all_runs = False
-                if tid in division_winners:
-                    missed_division_all_runs = False
-                if not missed_playoffs_all_runs and not missed_division_all_runs:
-                    break
+        flipper = CoinFlipper()
+        playoff_teams, division_winners = determine_playoffs(
+            sim_teams, h2h, sim_h2h, playoff_spots=playoff_spots, flipper=flipper
+        )
 
-            if not missed_playoffs_all_runs:
-                elim_all[tid] = False
-                game_idx = team_game_idx.get(tid)
-                if game_idx is not None and winners[game_idx] != tid:
-                    team_elim_when_loses[tid] = False
+        for tid, (won, lost, worst_goals, best_goals) in pending.items():
+            if not flipper.flips:
+                # No coin flips: standings are fully determined for everyone
+                worst = best = _achieved(tid, playoff_teams, division_winners)
+            else:
+                worst = pinned_result(sim_teams, sim_h2h, tid, False, worst_goals) if worst_goals else {}
+                best = pinned_result(sim_teams, sim_h2h, tid, True, best_goals) if best_goals else {}
 
-            if not missed_division_all_runs:
-                div_elim_all[tid] = False
-                game_idx = team_game_idx.get(tid)
-                if game_idx is not None and winners[game_idx] != tid:
-                    team_div_elim_when_loses[tid] = False
-
-            outcome_results[tid] = {
-                'clinch': made_playoffs_all_runs,
-                'elim': missed_playoffs_all_runs,
-                'div_clinch': won_division_all_runs,
-                'div_elim': missed_division_all_runs
-            }
-
-        outcome_playoff_results[outcome_key] = outcome_results
+            for g in worst_goals:
+                if not worst[g]:
+                    always[g][tid] = False
+                    if won:
+                        always_if_win[g][tid] = False
+            for g in best_goals:
+                if best[g]:
+                    never[g][tid] = False
+                    if lost:
+                        never_if_loss[g][tid] = False
 
     # Extract scenarios
     clinch_scenarios = []
     elimination_scenarios = []
 
     for tid in team_ids:
-        team = teams[tid]
         opponent_id = opponents.get(tid)
-        opponent = teams.get(opponent_id) if opponent_id else None
+        if opponent_id is None:
+            continue
+        team = teams[tid]
+        opponent = teams[opponent_id]
 
-        # === PLAYOFF CLINCH ===
-        if clinch_all[tid]:
-            pass  # Already clinched
-        elif team_clinch_when_wins[tid] and opponent:
-            clinch_scenarios.append(
-                f"{team.name} clinches playoff spot with a WIN vs {opponent.name}"
-            )
+        for goal, label in GOAL_LABELS.items():
+            if not always[goal][tid] and always_if_win[goal][tid]:
+                clinch_scenarios.append(f"{team.name} clinches {label} with a WIN vs {opponent.name}")
 
-        # === DIVISION CLINCH ===
-        if div_clinch_all[tid]:
-            pass  # Already clinched
-        elif team_div_clinch_when_wins[tid] and opponent:
-            clinch_scenarios.append(
-                f"{team.name} clinches division with a WIN vs {opponent.name}"
-            )
+        for goal, label in ELIMINATION_LABELS.items():
+            if not never[goal][tid] and never_if_loss[goal][tid]:
+                elimination_scenarios.append(f"{team.name} {label} if: LOSS to {opponent.name}")
 
-        # === PLAYOFF ELIMINATION ===
-        if elim_all[tid]:
-            pass  # Already eliminated
-        elif team_elim_when_loses[tid] and opponent:
-            elimination_scenarios.append(
-                f"{team.name} eliminated from playoffs if: LOSS to {opponent.name}"
-            )
-
-        # === DIVISION ELIMINATION ===
-        if div_elim_all[tid]:
-            pass  # Already eliminated
-        elif team_div_elim_when_loses[tid] and opponent:
-            elimination_scenarios.append(
-                f"{team.name} eliminated from division race if: LOSS to {opponent.name}"
-            )
+    statuses = {
+        tid: {
+            **{f"clinched_{g}": always[g][tid] for g in goals},
+            **{f"eliminated_{g}": never[g][tid] for g in goals},
+        }
+        for tid in team_ids
+    }
 
     if progress_callback:
         progress_callback(100)
 
-    # Deduplicate
-    seen = set()
-    unique_clinch = []
-    for s in clinch_scenarios:
-        if s not in seen:
-            seen.add(s)
-            unique_clinch.append(s)
-
-    seen_elim = set()
-    unique_elim = []
-    for s in elimination_scenarios:
-        if s not in seen_elim:
-            seen_elim.add(s)
-            unique_elim.append(s)
-
-    return unique_clinch, unique_elim
+    return ScenarioReport(_dedupe(clinch_scenarios), _dedupe(elimination_scenarios), statuses)

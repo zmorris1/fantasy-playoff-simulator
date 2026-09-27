@@ -36,9 +36,13 @@ class TestSleeperAdapter:
         with pytest.raises(ValueError, match="does not support baseball"):
             SleeperAdapter(sport=Sport.BASEBALL)
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_validate_league_not_found(self, adapter):
-        """Test validate_league raises LeagueNotFoundError for invalid league."""
+        """Test validate_league raises LeagueNotFoundError for invalid league.
+
+        Hits the live Sleeper API — marked integration, excluded in CI.
+        """
         with pytest.raises(LeagueNotFoundError):
             await adapter.validate_league("invalid_league_id", 2025)
 
@@ -156,8 +160,9 @@ class TestSleeperAdapter:
         assert h2h[(1, 2)] == (1, 1, 0)
 
 
+@pytest.mark.integration
 class TestSleeperAdapterIntegration:
-    """Integration tests that hit the real Sleeper API."""
+    """Integration tests that hit the real Sleeper API. Excluded in CI."""
 
     @pytest.mark.asyncio
     async def test_nfl_state_endpoint(self, adapter):
@@ -171,3 +176,57 @@ class TestSleeperAdapterIntegration:
         """Test that an invalid league ID returns LeagueNotFoundError."""
         with pytest.raises(LeagueNotFoundError):
             await adapter.validate_league("definitely_not_a_real_league_123456", 2025)
+
+
+class TestSleeperWeekHandling:
+    """Which weeks count as played comes from the league, not the global week."""
+
+    def fetcher(self, league, weeks):
+        async def fetch(endpoint):
+            if endpoint.startswith("/state/"):
+                return {"week": 99}  # must not be used when the league knows better
+            if "/matchups/" in endpoint:
+                return weeks.get(int(endpoint.rsplit("/", 1)[1]), [])
+            if endpoint.endswith("/rosters"):
+                return [{"roster_id": r, "owner_id": None, "settings": {"wins": 1, "losses": 1}} for r in (1, 2, 3, 4)]
+            if endpoint.endswith("/users"):
+                return []
+            return league
+        return fetch
+
+    @pytest.mark.asyncio
+    async def test_week_in_progress_is_remaining(self, adapter):
+        # Week 3 has partial points but is not in the standings yet
+        league = {"status": "in_season", "settings": {"last_scored_leg": 2, "playoff_week_start": 5}}
+        weeks = {
+            3: [{"roster_id": 1, "matchup_id": 1, "points": 31.2}, {"roster_id": 2, "matchup_id": 1, "points": 8.0},
+                {"roster_id": 3, "matchup_id": 2, "points": 0}, {"roster_id": 4, "matchup_id": 2, "points": 0}],
+            4: [{"roster_id": 1, "matchup_id": 1, "points": 0}, {"roster_id": 3, "matchup_id": 1, "points": 0},
+                {"roster_id": 2, "matchup_id": 2, "points": 0}, {"roster_id": 4, "matchup_id": 2, "points": 0}],
+        }
+        with patch.object(adapter, '_fetch_json', side_effect=self.fetcher(league, weeks)):
+            teams, _ = await adapter.fetch_standings("123", 2026)
+            remaining, current_week, total_weeks = await adapter.fetch_schedule("123", 2026, teams)
+
+        assert current_week == 3
+        assert total_weeks == 4
+        assert len(remaining) == 4
+        assert {m.week for m in remaining} == {3, 4}
+
+    @pytest.mark.asyncio
+    async def test_completed_league_has_no_remaining_games(self, adapter):
+        league = {"status": "complete", "settings": {"last_scored_leg": 17, "playoff_week_start": 15}}
+        weeks = {w: [{"roster_id": 1, "matchup_id": 1, "points": 100}, {"roster_id": 2, "matchup_id": 1, "points": 90}]
+                 for w in range(1, 18)}
+        with patch.object(adapter, '_fetch_json', side_effect=self.fetcher(league, weeks)):
+            teams, _ = await adapter.fetch_standings("123", 2025)
+            remaining, _, _ = await adapter.fetch_schedule("123", 2025, teams)
+            h2h = await adapter.fetch_head_to_head("123", 2025, teams)
+
+        assert remaining == []
+        # All 14 regular-season weeks count toward H2H, none of the playoffs
+        assert h2h[(1, 2)] == (14, 0, 0)
+
+    def test_hockey_is_rejected_up_front(self):
+        with pytest.raises(ValueError, match="does not support hockey"):
+            SleeperAdapter(sport=Sport.HOCKEY)

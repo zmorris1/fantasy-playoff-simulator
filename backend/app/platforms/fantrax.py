@@ -5,6 +5,8 @@ Fetches league data from Fantrax's unofficial API for public leagues.
 Fantrax supports football, basketball, baseball, hockey, soccer, golf, and racing.
 """
 
+import zlib
+
 import httpx
 from collections import defaultdict
 from typing import Dict, List, Tuple, Any
@@ -16,6 +18,7 @@ from .base import (
     PlatformError
 )
 from ..simulator.models import Team, Matchup, H2HDict
+from ..core.http import async_client
 from ..core.sports import Sport, FANTRAX_SPORT_CODES
 
 
@@ -35,6 +38,7 @@ class FantraxAdapter(PlatformAdapter):
         self.sport = sport
         self.timeout = timeout
         self._league_info_cache: Dict[str, Dict] = {}
+        self._team_id_map: Dict[str, int] = {}
 
     def _get_sport_code(self) -> str:
         """Get the Fantrax API sport code for the current sport."""
@@ -48,9 +52,10 @@ class FantraxAdapter(PlatformAdapter):
         """
         Convert Fantrax's string team ID to an integer.
 
-        Uses a simple hash to create a consistent integer ID.
+        Uses CRC32 so the ID is the same in every process; Python's hash()
+        of a string is randomized per process, so IDs changed on restart.
         """
-        return abs(hash(team_id)) % (10 ** 9)
+        return zlib.crc32(team_id.encode("utf-8")) % (10 ** 9)
 
     async def _call_api(self, method: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -70,7 +75,7 @@ class FantraxAdapter(PlatformAdapter):
         """
         payload = {"msgs": [{"method": method, "data": data}]}
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with async_client(self.timeout) as client:
             try:
                 response = await client.post(
                     self.BASE_URL,
@@ -233,8 +238,6 @@ class FantraxAdapter(PlatformAdapter):
                 teams[team_id_int] = team
 
                 # Store mapping for later use
-                if not hasattr(self, '_team_id_map'):
-                    self._team_id_map: Dict[str, int] = {}
                 self._team_id_map[team_id_str] = team_id_int
 
         # Calculate division records if there are divisions

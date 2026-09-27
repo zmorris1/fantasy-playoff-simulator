@@ -93,3 +93,23 @@ def get_current_season(sport: Sport) -> int:
     else:  # Hockey
         # NHL season spans two years, similar to NBA
         return now.year + 1 if now.month >= 10 else now.year
+
+
+def get_season_candidates(sport: Sport) -> list:
+    """
+    Seasons to try, in order, when the caller has not pinned one.
+
+    The current season is tried first, then the prior season. During the
+    off-season the "current" season may not exist yet on the platform —
+    e.g. ESPN football between March and August resolves to a season ESPN
+    hasn't created — so callers should fall back to the next candidate on
+    a not-found response.
+
+    Args:
+        sport: The sport to get season candidates for
+
+    Returns:
+        Season years to try, most recent first
+    """
+    current = get_current_season(sport)
+    return [current, current - 1]
